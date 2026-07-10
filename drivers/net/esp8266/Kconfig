@@ -21,6 +21,8 @@ config ESP8266_NETDEV
 	bool "ESP8266/ESP01 network device driver"
 	default n
 	depends on NET
+	select DRIVERS_WIRELESS
+	select NETDEV_WIRELESS_IOCTL
 	select NETDEV_WIRELESS_HANDLER
 	---help---
 		Enable ESP8266/ESP01 as a NuttX netdev (network interface card).
