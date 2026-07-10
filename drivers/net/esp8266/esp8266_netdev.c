@@ -49,7 +49,6 @@
 
 #include <nuttx/net/netdev_lowerhalf.h>
 #include <nuttx/net/ip.h>
-#include <nuttx/mm/iob.h>
 
 #include "esp8266_netdev.h"
 
@@ -365,6 +364,7 @@ static int esp8266_read(FAR struct esp8266_lowerhalf_s *priv,
                         int timeout_ms)
 {
   clock_t ticks;
+  irqstate_t flags = 0;
   int ret;
 
   ticks = MSEC2TICK(timeout_ms);
@@ -381,7 +381,7 @@ static int esp8266_read(FAR struct esp8266_lowerhalf_s *priv,
           return -1;
         }
 
-      spin_lock_irqsave(NULL, priv->worker.lock);
+      flags = spin_lock_irqsave(&priv->worker.lock);
 
       if (priv->worker.ans != ESP8266_ANS_NONE)
         {
@@ -397,7 +397,7 @@ static int esp8266_read(FAR struct esp8266_lowerhalf_s *priv,
 
       priv->worker.buf[0] = '\0';
 
-      spin_unlock_irqrestore(NULL, priv->worker.lock);
+      spin_unlock_irqrestore(&priv->worker.lock, flags);
     }
   while ((ret <= 0) && (priv->ans == ESP8266_ANS_NONE));
 
@@ -426,7 +426,7 @@ static void esp8266_flush(FAR struct esp8266_lowerhalf_s *priv)
 static int esp8266_read_ans_ok(FAR struct esp8266_lowerhalf_s *priv,
                                 int timeout_ms)
 {
-  int ret;
+  int ret = 0;
   time_t end;
 
   end = time(NULL) + (timeout_ms / 1000) + ESP8266_FLOODING_OFFSET_S;
@@ -508,6 +508,7 @@ static int esp8266_read_ipd(FAR struct esp8266_lowerhalf_s *priv,
                              int sockfd, int len)
 {
   struct esp8266_socket_s *sock;
+  irqstate_t flags = 0;
 
   sock = esp8266_get_sock(priv, sockfd);
 
@@ -515,7 +516,7 @@ static int esp8266_read_ipd(FAR struct esp8266_lowerhalf_s *priv,
 
   while (len)
     {
-      uint8_t *buf;
+      FAR uint8_t *buf;
       int size;
       uint8_t b;
       int next;
@@ -551,9 +552,9 @@ static int esp8266_read_ipd(FAR struct esp8266_lowerhalf_s *priv,
                 {
                   /* FIFO full — yield briefly to let consumer drain */
 
-                  spin_unlock_irqrestore(NULL, priv->worker.lock);
+                  spin_unlock_irqrestore(&priv->worker.lock, flags);
                   nxsig_usleep(100);
-                  spin_lock_irqsave(NULL, priv->worker.lock);
+                  flags = spin_lock_irqsave(&priv->worker.lock);
                 }
 
               if (next != sock->outndx)
@@ -589,6 +590,7 @@ static void esp8266_rx_avail(FAR struct esp8266_lowerhalf_s *priv,
 {
   struct esp8266_socket_s *sock;
   FAR netpkt_t *pkt;
+  irqstate_t flags;
   int avail;
 
   sock = esp8266_get_sock(priv, sockfd);
@@ -641,11 +643,32 @@ static void esp8266_rx_avail(FAR struct esp8266_lowerhalf_s *priv,
 
   sock->outndx = sock->inndx;
 
-  /* Enqueue for upper half to pick up */
+  /* Enqueue for upper half to pick up — use simple linked list */
 
-  spin_lock_irqsave(NULL, priv->rxlock);
-  iob_tryadd_queue(pkt, &priv->rxqueue);
-  spin_unlock_irqrestore(NULL, priv->rxlock);
+  flags = spin_lock_irqsave(&priv->rxlock);
+  {
+    FAR struct esp8266_rxnode_s *node;
+    node = kmm_malloc(sizeof(struct esp8266_rxnode_s));
+    if (node != NULL)
+      {
+        node->pkt   = pkt;
+        node->flink = NULL;
+        if (priv->rxtail != NULL)
+          {
+            priv->rxtail->flink = node;
+          }
+        else
+          {
+            priv->rxhead = node;
+          }
+        priv->rxtail = node;
+      }
+    else
+      {
+        netpkt_free(&priv->dev, pkt, NETPKT_RX);
+      }
+  }
+  spin_unlock_irqrestore(&priv->rxlock, flags);
 }
 
 /****************************************************************************
@@ -660,6 +683,7 @@ static void esp8266_rx_avail(FAR struct esp8266_lowerhalf_s *priv,
 static int esp8266_worker(int argc, FAR char *argv[])
 {
   FAR struct esp8266_lowerhalf_s *priv;
+  irqstate_t flags;
   int rxlen = 0;
 
   if (argc < 1 || argv[1] == NULL)
@@ -690,7 +714,7 @@ static int esp8266_worker(int argc, FAR char *argv[])
           continue;
         }
 
-      spin_lock_irqsave(NULL, priv->worker.lock);
+      flags = spin_lock_irqsave(&priv->worker.lock);
 
       if (c == '\n')
         {
@@ -728,9 +752,9 @@ static int esp8266_worker(int argc, FAR char *argv[])
                 {
                   if (priv->worker.buf[0] != '\0')
                     {
-                      spin_unlock_irqrestore(NULL, priv->worker.lock);
+                      spin_unlock_irqrestore(&priv->worker.lock, flags);
                       nxsig_usleep(100);
-                      spin_lock_irqsave(NULL, priv->worker.lock);
+                      flags = spin_lock_irqsave(&priv->worker.lock);
                     }
 
                   if (rxlen + 1 <= BUF_ANS_LEN)
@@ -767,9 +791,9 @@ static int esp8266_worker(int argc, FAR char *argv[])
                   len = esp8266_str_to_unsigned(&ptr, ':');
                   if (len >= 0)
                     {
-                      spin_unlock_irqrestore(NULL, priv->worker.lock);
+                      spin_unlock_irqrestore(&priv->worker.lock, flags);
                       esp8266_read_ipd(priv, sockfd, len);
-                      spin_lock_irqsave(NULL, priv->worker.lock);
+                      flags = spin_lock_irqsave(&priv->worker.lock);
                     }
                 }
 
@@ -781,7 +805,7 @@ static int esp8266_worker(int argc, FAR char *argv[])
           nerr("Worker: char overflow\n");
         }
 
-      spin_unlock_irqrestore(NULL, priv->worker.lock);
+      spin_unlock_irqrestore(&priv->worker.lock, flags);
     }
 
   ninfo("ESP8266 worker stopped\n");
@@ -1064,7 +1088,7 @@ static int esp8266_ifup(FAR struct netdev_lowerhalf_s *dev)
                      &priv->mac[0], &priv->mac[1], &priv->mac[2],
                      &priv->mac[3], &priv->mac[4], &priv->mac[5]);
               priv->mac_valid = true;
-              memcpy(dev->netdev.d_mac.ether_addr_octet, priv->mac,
+              memcpy(dev->netdev.d_mac.ether.ether_addr_octet, priv->mac,
                      ESP8266_MAC_LEN);
             }
         }
@@ -1209,10 +1233,27 @@ static FAR netpkt_t *esp8266_receive(FAR struct netdev_lowerhalf_s *dev)
 {
   FAR struct esp8266_lowerhalf_s *priv = esp8266_priv(dev);
   FAR netpkt_t *pkt;
+  irqstate_t flags;
 
-  spin_lock_irqsave(NULL, priv->rxlock);
-  pkt = iob_remove_queue(&priv->rxqueue);
-  spin_unlock_irqrestore(NULL, priv->rxlock);
+  flags = spin_lock_irqsave(&priv->rxlock);
+  {
+    FAR struct esp8266_rxnode_s *node = priv->rxhead;
+    if (node != NULL)
+      {
+        pkt = node->pkt;
+        priv->rxhead = node->flink;
+        if (priv->rxhead == NULL)
+          {
+            priv->rxtail = NULL;
+          }
+        kmm_free(node);
+      }
+    else
+      {
+        pkt = NULL;
+      }
+  }
+  spin_unlock_irqrestore(&priv->rxlock, flags);
 
   return pkt;
 }
@@ -1334,7 +1375,7 @@ static int esp8266_iw_bssid(FAR struct netdev_lowerhalf_s *dev,
        */
 
       FAR struct esp8266_lowerhalf_s *priv = esp8266_priv(dev);
-      FAR struct iw_point *iwp = &iwr->u.ap_addr;
+      FAR struct sockaddr *ap = &iwr->u.ap_addr;
       int ret;
 
       ret = esp8266_check(priv);
@@ -1360,15 +1401,15 @@ static int esp8266_iw_bssid(FAR struct netdev_lowerhalf_s *dev,
 
       /* p now points to "BSSID",... */
       if (*p == '"') p++;
-      if (iwp->pointer != NULL)
+      if (ap != NULL)
         {
           /* BSSID format: "aa:bb:cc:dd:ee:ff" */
           uint8_t mac[6];
           sscanf(p, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
                  &mac[0], &mac[1], &mac[2],
                  &mac[3], &mac[4], &mac[5]);
-          memcpy(iwp->pointer, mac, 6);
-          iwp->flags = 1;
+          memcpy(ap->sa_data, mac, 6);
+          ap->sa_family = AF_INET;
         }
 
       esp8266_read_ans_ok(priv, ESP8266_TIMEOUT_MS);
@@ -1541,11 +1582,12 @@ int esp8266_netdev_register(FAR const char *uart_dev)
                                      esp8266_worker, argv);
   if (priv->worker.pid < 0)
     {
+      int errcode = priv->worker.pid;
       nerr("ERROR: Failed to create worker thread\n");
       nxsem_destroy(&priv->worker.sem);
       close(priv->fd);
       kmm_free(priv);
-      return priv->worker.pid;
+      return errcode;
     }
 
   /* Perform initial AT handshake */

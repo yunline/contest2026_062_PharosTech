@@ -52,6 +52,16 @@
  * Public Types
  ****************************************************************************/
 
+/* Simple singly-linked list node for pending RX packets.
+ * This avoids dependency on CONFIG_IOB_NCHAINS.
+ */
+
+struct esp8266_rxnode_s
+{
+  FAR struct esp8266_rxnode_s *flink;
+  FAR netpkt_t                *pkt;
+};
+
 /* Socket for data communication (0-4, 0 is for single connection) */
 
 struct esp8266_socket_s
@@ -106,7 +116,8 @@ struct esp8266_lowerhalf_s
 
   /* RX queue for packets received from ESP8266 */
 
-  netpkt_queue_t     rxqueue;
+  FAR struct esp8266_rxnode_s *rxhead;
+  FAR struct esp8266_rxnode_s *rxtail;
   spinlock_t         rxlock;
 
   /* MAC address learned from ESP8266 */
@@ -158,4 +169,5 @@ int esp8266_netdev_register(FAR const char *uart_dev);
 }
 #endif
 
+#endif /* CONFIG_ESP8266_NETDEV */
 #endif /* __DRIVERS_NET_ESP8266_ESP8266_NETDEV_H */
