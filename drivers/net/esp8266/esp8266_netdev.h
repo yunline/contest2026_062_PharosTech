@@ -28,25 +28,102 @@
  ****************************************************************************/
 
 #include <nuttx/config.h>
+#include <nuttx/net/netdev_lowerhalf.h>
+#include <nuttx/wireless/wireless.h>
+
+#ifdef CONFIG_ESP8266_NETDEV
 
 /****************************************************************************
  * Pre-processor Definitions
  ****************************************************************************/
 
-/* TODO: Add pre-processor definitions here */
+#define ESP8266_SOCKET_NBR   4
+#define ESP8266_FIFO_SIZE    2048     /* Must be a power of 2 */
+
+#define ESP8266_MAC_LEN      6
+
+/* ESP8266 AT response codes */
+
+#define ESP8266_ANS_NONE     0
+#define ESP8266_ANS_OK       1
+#define ESP8266_ANS_ERR      (-1)
 
 /****************************************************************************
  * Public Types
  ****************************************************************************/
 
-/* TODO: Add type definitions here, e.g.:
- *
- * struct esp8266_netdev_s
- * {
- *   struct netdev_lowerhalf_s dev;   // Must be first
- *   ...
- * };
- */
+/* Socket for data communication (0-4, 0 is for single connection) */
+
+struct esp8266_socket_s
+{
+  uint8_t   flags;
+  uint16_t  inndx;
+  uint16_t  outndx;
+  uint8_t   rxbuf[ESP8266_FIFO_SIZE];
+};
+
+/* Worker thread state for parsing AT responses */
+
+struct esp8266_worker_s
+{
+  bool      running;
+  pid_t     pid;
+
+  char      rxbuf[CONFIG_ESP8266_NETDEV_AT_LINEBUF];
+
+  sem_t     sem;  /* Inform that something is received */
+  char      buf[CONFIG_ESP8266_NETDEV_AT_LINEBUF]; /* Last complete line */
+  int8_t    ans;  /* Last answer received (OK/ERROR/FAIL) */
+
+  spinlock_t lock;
+};
+
+/* ESP8266 lower-half netdev state structure */
+
+struct esp8266_lowerhalf_s
+{
+  /* Must be first so we can cast to netdev_lowerhalf_s */
+
+  struct netdev_lowerhalf_s dev;
+
+  /* UART communication */
+
+  int                fd;
+
+  /* Worker thread for AT parsing */
+
+  struct esp8266_worker_s worker;
+
+  /* Data sockets */
+
+  struct esp8266_socket_s sockets[ESP8266_SOCKET_NBR];
+
+  /* AT command / response buffers */
+
+  int8_t             ans;
+  char               bufans[CONFIG_ESP8266_NETDEV_AT_LINEBUF];
+  char               bufcmd[CONFIG_ESP8266_NETDEV_AT_LINEBUF];
+
+  /* RX queue for packets received from ESP8266 */
+
+  netpkt_queue_t     rxqueue;
+  spinlock_t         rxlock;
+
+  /* MAC address learned from ESP8266 */
+
+  uint8_t            mac[ESP8266_MAC_LEN];
+  bool               mac_valid;
+
+  /* Connection state */
+
+  bool               connected;  /* Wi-Fi associated */
+  bool               ifup;
+
+  /* AP scan callback state */
+
+  FAR struct iwreq  *scan_iwr;
+  sem_t              scan_sem;
+};
 
 /****************************************************************************
  * Public Function Prototypes
