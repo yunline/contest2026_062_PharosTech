@@ -31,31 +31,6 @@ config ESP8266_NETDEV
 
 if ESP8266_NETDEV
 
-config ESP8266_NETDEV_UART_DEV
-	string "UART device path for ESP8266 communication"
-	default "/dev/ttyS1"
-	---help---
-		The serial port used to communicate with the ESP01 module
-		via AT commands.
-
-config ESP8266_NETDEV_BAUDRATE
-	int "UART baud rate"
-	default 115200
-	---help---
-		Baud rate for the UART connection to the ESP01 module.
-
-config ESP8266_NETDEV_TXBUF_SIZE
-	int "TX buffer size"
-	default 1536
-	---help---
-		Maximum size of a single transmit frame (bytes).
-
-config ESP8266_NETDEV_RXBUF_SIZE
-	int "RX buffer size"
-	default 1536
-	---help---
-		Maximum size of a single receive frame (bytes).
-
 config ESP8266_NETDEV_AT_LINEBUF
 	int "AT command line buffer size"
 	default 512
