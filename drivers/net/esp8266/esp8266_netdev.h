@@ -58,8 +58,8 @@
 
 struct esp8266_rxnode_s
 {
-  FAR struct esp8266_rxnode_s *flink;
-  FAR netpkt_t                *pkt;
+  struct esp8266_rxnode_s *flink;
+  netpkt_t                *pkt;
 };
 
 /* Socket for data communication (0-4, 0 is for single connection) */
@@ -116,8 +116,8 @@ struct esp8266_lowerhalf_s
 
   /* RX queue for packets received from ESP8266 */
 
-  FAR struct esp8266_rxnode_s *rxhead;
-  FAR struct esp8266_rxnode_s *rxtail;
+  struct esp8266_rxnode_s *rxhead;
+  struct esp8266_rxnode_s *rxtail;
   spinlock_t         rxlock;
 
   /* MAC address learned from ESP8266 */
@@ -132,7 +132,7 @@ struct esp8266_lowerhalf_s
 
   /* AP scan callback state */
 
-  FAR struct iwreq  *scan_iwr;
+  struct iwreq  *scan_iwr;
   sem_t              scan_sem;
 };
 
@@ -162,7 +162,7 @@ extern "C"
  *
  ****************************************************************************/
 
-int esp8266_netdev_register(FAR const char *uart_dev);
+int esp8266_netdev_register(const char *uart_dev);
 
 #undef EXTERN
 #ifdef __cplusplus

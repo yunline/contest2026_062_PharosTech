@@ -88,75 +88,75 @@
  ****************************************************************************/
 
 /* Forward cast helper */
-static FAR struct esp8266_lowerhalf_s *
-esp8266_priv(FAR struct netdev_lowerhalf_s *dev);
+static struct esp8266_lowerhalf_s *
+esp8266_priv(struct netdev_lowerhalf_s *dev);
 
 /* Low-level UART I/O */
-static int  esp8266_low_read(FAR struct esp8266_lowerhalf_s *priv,
-                             FAR uint8_t *buf, int size);
-static int  esp8266_vsend_cmd(FAR struct esp8266_lowerhalf_s *priv,
-                              FAR const IPTR char *format, va_list ap);
-static int  esp8266_send_cmd(FAR struct esp8266_lowerhalf_s *priv,
-                             FAR const IPTR char *format, ...);
+static int  esp8266_low_read(struct esp8266_lowerhalf_s *priv,
+                             uint8_t *buf, int size);
+static int  esp8266_vsend_cmd(struct esp8266_lowerhalf_s *priv,
+                              const IPTR char *format, va_list ap);
+static int  esp8266_send_cmd(struct esp8266_lowerhalf_s *priv,
+                             const IPTR char *format, ...);
 
 /* AT response reading */
-static int  esp8266_read(FAR struct esp8266_lowerhalf_s *priv,
+static int  esp8266_read(struct esp8266_lowerhalf_s *priv,
                          int timeout_ms);
-static void esp8266_flush(FAR struct esp8266_lowerhalf_s *priv);
-static int  esp8266_read_ans_ok(FAR struct esp8266_lowerhalf_s *priv,
+static void esp8266_flush(struct esp8266_lowerhalf_s *priv);
+static int  esp8266_read_ans_ok(struct esp8266_lowerhalf_s *priv,
                                 int timeout_ms);
-static int  esp8266_ask_ans_ok(FAR struct esp8266_lowerhalf_s *priv,
+static int  esp8266_ask_ans_ok(struct esp8266_lowerhalf_s *priv,
                                int timeout_ms,
-                               FAR const IPTR char *format, ...);
-static int  esp8266_check(FAR struct esp8266_lowerhalf_s *priv);
+                               const IPTR char *format, ...);
+static int  esp8266_check(struct esp8266_lowerhalf_s *priv);
 
 /* Socket management */
 static struct esp8266_socket_s *
-esp8266_get_sock(FAR struct esp8266_lowerhalf_s *priv, int sockfd);
-static void esp8266_sock_closed(FAR struct esp8266_lowerhalf_s *priv,
+esp8266_get_sock(struct esp8266_lowerhalf_s *priv, int sockfd);
+static void esp8266_sock_closed(struct esp8266_lowerhalf_s *priv,
                                 int sockfd);
 
 /* Data path */
-static int  esp8266_read_ipd(FAR struct esp8266_lowerhalf_s *priv,
+static int  esp8266_read_ipd(struct esp8266_lowerhalf_s *priv,
                              int sockfd, int len);
-static void esp8266_rx_avail(FAR struct esp8266_lowerhalf_s *priv,
+static void esp8266_rx_avail(struct esp8266_lowerhalf_s *priv,
                              int sockfd);
 
 /* Worker thread */
-static int  esp8266_worker(int argc, FAR char *argv[]);
+static int  esp8266_worker(int argc, char *argv[]);
 
 /* Utility */
 static inline int
-esp8266_str_to_unsigned(FAR char **p_ptr, char end);
+esp8266_str_to_unsigned(char **p_ptr, char end);
 
 /* AT response parsers */
-static int  esp8266_parse_cwjap_ans_line(FAR char *ptr,
-                                         FAR struct iw_point *iwp);
-static int  esp8266_parse_cwlap_ans_line(FAR char *ptr,
-                                         FAR struct iw_point *iwp);
-static int  esp8266_parse_cipxxx_ans_line(FAR const char *ptr,
-                                          FAR in_addr_t *ip);
+static int  esp8266_parse_cwjap_ans_line(char *ptr,
+                                         struct iw_point *iwp);
+static int  esp8266_parse_cwlap_ans_line(char *ptr,
+                                         struct iw_point *iwp);
+static int  esp8266_parse_cipxxx_ans_line(const char *ptr,
+                                          in_addr_t *ip);
 
 /* netdev_lowerhalf ops */
-static int  esp8266_ifup(FAR struct netdev_lowerhalf_s *dev);
-static int  esp8266_ifdown(FAR struct netdev_lowerhalf_s *dev);
-static int  esp8266_transmit(FAR struct netdev_lowerhalf_s *dev,
-                             FAR netpkt_t *pkt);
-static FAR netpkt_t *esp8266_receive(FAR struct netdev_lowerhalf_s *dev);
-static void esp8266_reclaim(FAR struct netdev_lowerhalf_s *dev);
+static int  esp8266_ifup(struct netdev_lowerhalf_s *dev);
+static int  esp8266_ifdown(struct netdev_lowerhalf_s *dev);
+static int  esp8266_transmit(struct netdev_lowerhalf_s *dev,
+                             netpkt_t *pkt);
+static netpkt_t *esp8266_receive(struct netdev_lowerhalf_s *dev);
+static void esp8266_reclaim(struct netdev_lowerhalf_s *dev);
 
 #ifdef CONFIG_NETDEV_WIRELESS_HANDLER
 /* Wireless ops */
-static int  esp8266_iw_connect(FAR struct netdev_lowerhalf_s *dev);
-static int  esp8266_iw_disconnect(FAR struct netdev_lowerhalf_s *dev);
-static int  esp8266_iw_essid(FAR struct netdev_lowerhalf_s *dev,
-                             FAR struct iwreq *iwr, bool set);
-static int  esp8266_iw_bssid(FAR struct netdev_lowerhalf_s *dev,
-                             FAR struct iwreq *iwr, bool set);
-static int  esp8266_iw_passwd(FAR struct netdev_lowerhalf_s *dev,
-                              FAR struct iwreq *iwr, bool set);
-static int  esp8266_iw_scan(FAR struct netdev_lowerhalf_s *dev,
-                            FAR struct iwreq *iwr, bool set);
+static int  esp8266_iw_connect(struct netdev_lowerhalf_s *dev);
+static int  esp8266_iw_disconnect(struct netdev_lowerhalf_s *dev);
+static int  esp8266_iw_essid(struct netdev_lowerhalf_s *dev,
+                             struct iwreq *iwr, bool set);
+static int  esp8266_iw_bssid(struct netdev_lowerhalf_s *dev,
+                             struct iwreq *iwr, bool set);
+static int  esp8266_iw_passwd(struct netdev_lowerhalf_s *dev,
+                              struct iwreq *iwr, bool set);
+static int  esp8266_iw_scan(struct netdev_lowerhalf_s *dev,
+                            struct iwreq *iwr, bool set);
 #endif
 
 /****************************************************************************
@@ -192,20 +192,20 @@ static const struct wireless_ops_s g_esp8266_iw_ops =
  * Name: esp8266_priv
  ****************************************************************************/
 
-static FAR struct esp8266_lowerhalf_s *
-esp8266_priv(FAR struct netdev_lowerhalf_s *dev)
+static struct esp8266_lowerhalf_s *
+esp8266_priv(struct netdev_lowerhalf_s *dev)
 {
-  return (FAR struct esp8266_lowerhalf_s *)dev;
+  return (struct esp8266_lowerhalf_s *)dev;
 }
 
 /****************************************************************************
  * Name: esp8266_str_to_unsigned
  ****************************************************************************/
 
-static inline int esp8266_str_to_unsigned(FAR char **p_ptr, char end)
+static inline int esp8266_str_to_unsigned(char **p_ptr, char end)
 {
   int nbr = 0;
-  FAR char *ptr = *p_ptr;
+  char *ptr = *p_ptr;
 
   while (*ptr != end)
     {
@@ -228,13 +228,13 @@ static inline int esp8266_str_to_unsigned(FAR char **p_ptr, char end)
  ****************************************************************************/
 
 static inline void
-esp8266_clear_read_buffer(FAR struct esp8266_lowerhalf_s *priv)
+esp8266_clear_read_buffer(struct esp8266_lowerhalf_s *priv)
 {
   priv->bufans[0] = '\0';
 }
 
 static inline void
-esp8266_clear_read_ans(FAR struct esp8266_lowerhalf_s *priv)
+esp8266_clear_read_ans(struct esp8266_lowerhalf_s *priv)
 {
   priv->ans = ESP8266_ANS_NONE;
 }
@@ -244,7 +244,7 @@ esp8266_clear_read_ans(FAR struct esp8266_lowerhalf_s *priv)
  ****************************************************************************/
 
 static struct esp8266_socket_s *
-esp8266_get_sock(FAR struct esp8266_lowerhalf_s *priv, int sockfd)
+esp8266_get_sock(struct esp8266_lowerhalf_s *priv, int sockfd)
 {
   DEBUGASSERT(sockfd >= 0);
 
@@ -265,7 +265,7 @@ esp8266_get_sock(FAR struct esp8266_lowerhalf_s *priv, int sockfd)
  * Name: esp8266_sock_closed
  ****************************************************************************/
 
-static void esp8266_sock_closed(FAR struct esp8266_lowerhalf_s *priv,
+static void esp8266_sock_closed(struct esp8266_lowerhalf_s *priv,
                                 int sockfd)
 {
   struct esp8266_socket_s *sock;
@@ -289,8 +289,8 @@ static void esp8266_sock_closed(FAR struct esp8266_lowerhalf_s *priv,
  *
  ****************************************************************************/
 
-static int esp8266_low_read(FAR struct esp8266_lowerhalf_s *priv,
-                            FAR uint8_t *buf, int size)
+static int esp8266_low_read(struct esp8266_lowerhalf_s *priv,
+                            uint8_t *buf, int size)
 {
   int ret;
 
@@ -308,8 +308,8 @@ static int esp8266_low_read(FAR struct esp8266_lowerhalf_s *priv,
  * Name: esp8266_vsend_cmd
  ****************************************************************************/
 
-static int esp8266_vsend_cmd(FAR struct esp8266_lowerhalf_s *priv,
-                             FAR const IPTR char *format, va_list ap)
+static int esp8266_vsend_cmd(struct esp8266_lowerhalf_s *priv,
+                             const IPTR char *format, va_list ap)
 {
   int ret;
 
@@ -336,8 +336,8 @@ static int esp8266_vsend_cmd(FAR struct esp8266_lowerhalf_s *priv,
  * Name: esp8266_send_cmd
  ****************************************************************************/
 
-static int esp8266_send_cmd(FAR struct esp8266_lowerhalf_s *priv,
-                            FAR const IPTR char *format, ...)
+static int esp8266_send_cmd(struct esp8266_lowerhalf_s *priv,
+                            const IPTR char *format, ...)
 {
   int ret;
   va_list ap;
@@ -360,7 +360,7 @@ static int esp8266_send_cmd(FAR struct esp8266_lowerhalf_s *priv,
  *
  ****************************************************************************/
 
-static int esp8266_read(FAR struct esp8266_lowerhalf_s *priv,
+static int esp8266_read(struct esp8266_lowerhalf_s *priv,
                         int timeout_ms)
 {
   clock_t ticks;
@@ -409,7 +409,7 @@ static int esp8266_read(FAR struct esp8266_lowerhalf_s *priv,
  * Name: esp8266_flush
  ****************************************************************************/
 
-static void esp8266_flush(FAR struct esp8266_lowerhalf_s *priv)
+static void esp8266_flush(struct esp8266_lowerhalf_s *priv)
 {
   do
     {
@@ -423,7 +423,7 @@ static void esp8266_flush(FAR struct esp8266_lowerhalf_s *priv)
  * Name: esp8266_read_ans_ok
  ****************************************************************************/
 
-static int esp8266_read_ans_ok(FAR struct esp8266_lowerhalf_s *priv,
+static int esp8266_read_ans_ok(struct esp8266_lowerhalf_s *priv,
                                 int timeout_ms)
 {
   int ret = 0;
@@ -453,9 +453,9 @@ static int esp8266_read_ans_ok(FAR struct esp8266_lowerhalf_s *priv,
  * Name: esp8266_ask_ans_ok
  ****************************************************************************/
 
-static int esp8266_ask_ans_ok(FAR struct esp8266_lowerhalf_s *priv,
+static int esp8266_ask_ans_ok(struct esp8266_lowerhalf_s *priv,
                                int timeout_ms,
-                               FAR const IPTR char *format, ...)
+                               const IPTR char *format, ...)
 {
   int ret;
   va_list ap;
@@ -476,7 +476,7 @@ static int esp8266_ask_ans_ok(FAR struct esp8266_lowerhalf_s *priv,
  * Name: esp8266_check
  ****************************************************************************/
 
-static int esp8266_check(FAR struct esp8266_lowerhalf_s *priv)
+static int esp8266_check(struct esp8266_lowerhalf_s *priv)
 {
   if (priv->fd < 0)
     {
@@ -504,7 +504,7 @@ static int esp8266_check(FAR struct esp8266_lowerhalf_s *priv)
  *
  ****************************************************************************/
 
-static int esp8266_read_ipd(FAR struct esp8266_lowerhalf_s *priv,
+static int esp8266_read_ipd(struct esp8266_lowerhalf_s *priv,
                              int sockfd, int len)
 {
   struct esp8266_socket_s *sock;
@@ -516,7 +516,7 @@ static int esp8266_read_ipd(FAR struct esp8266_lowerhalf_s *priv,
 
   while (len)
     {
-      FAR uint8_t *buf;
+      uint8_t *buf;
       int size;
       uint8_t b;
       int next;
@@ -585,11 +585,11 @@ static int esp8266_read_ipd(FAR struct esp8266_lowerhalf_s *priv,
  *
  ****************************************************************************/
 
-static void esp8266_rx_avail(FAR struct esp8266_lowerhalf_s *priv,
+static void esp8266_rx_avail(struct esp8266_lowerhalf_s *priv,
                               int sockfd)
 {
   struct esp8266_socket_s *sock;
-  FAR netpkt_t *pkt;
+  netpkt_t *pkt;
   irqstate_t flags;
   int avail;
 
@@ -647,7 +647,7 @@ static void esp8266_rx_avail(FAR struct esp8266_lowerhalf_s *priv,
 
   flags = spin_lock_irqsave(&priv->rxlock);
   {
-    FAR struct esp8266_rxnode_s *node;
+    struct esp8266_rxnode_s *node;
     node = kmm_malloc(sizeof(struct esp8266_rxnode_s));
     if (node != NULL)
       {
@@ -680,9 +680,9 @@ static void esp8266_rx_avail(FAR struct esp8266_lowerhalf_s *priv,
  *
  ****************************************************************************/
 
-static int esp8266_worker(int argc, FAR char *argv[])
+static int esp8266_worker(int argc, char *argv[])
 {
-  FAR struct esp8266_lowerhalf_s *priv;
+  struct esp8266_lowerhalf_s *priv;
   irqstate_t flags;
   int rxlen = 0;
 
@@ -691,7 +691,7 @@ static int esp8266_worker(int argc, FAR char *argv[])
       return -EINVAL;
     }
 
-  priv = (FAR struct esp8266_lowerhalf_s *)
+  priv = (struct esp8266_lowerhalf_s *)
          ((uintptr_t)strtoul(argv[1], NULL, 0));
 
   ninfo("ESP8266 worker started\n");
@@ -781,7 +781,7 @@ static int esp8266_worker(int argc, FAR char *argv[])
               (rxlen >= 5) &&
               (memcmp(priv->worker.rxbuf, "+IPD,", 5) == 0))
             {
-              FAR char *ptr = priv->worker.rxbuf + 5;
+              char *ptr = priv->worker.rxbuf + 5;
               int sockfd;
               int len;
 
@@ -825,14 +825,14 @@ static int esp8266_worker(int argc, FAR char *argv[])
  *
  ****************************************************************************/
 
-static int esp8266_parse_cipxxx_ans_line(FAR const char *ptr,
-                                          FAR in_addr_t *ip)
+static int esp8266_parse_cipxxx_ans_line(const char *ptr,
+                                          in_addr_t *ip)
 {
   int field_idx;
-  FAR char *str;
-  FAR char *ptr_next;
+  char *str;
+  char *ptr_next;
 
-  str = (FAR char *)ptr;
+  str = (char *)ptr;
 
   for (field_idx = 0; field_idx <= 2; field_idx++)
     {
@@ -894,11 +894,11 @@ static int esp8266_parse_cipxxx_ans_line(FAR const char *ptr,
  *
  ****************************************************************************/
 
-static int esp8266_parse_cwjap_ans_line(FAR char *ptr,
-                                         FAR struct iw_point *iwp)
+static int esp8266_parse_cwjap_ans_line(char *ptr,
+                                         struct iw_point *iwp)
 {
   int field_idx;
-  FAR char *ptr_next;
+  char *ptr_next;
 
   for (field_idx = 0; field_idx <= 4; field_idx++)
     {
@@ -973,8 +973,8 @@ static int esp8266_parse_cwjap_ans_line(FAR char *ptr,
  *
  ****************************************************************************/
 
-static int esp8266_parse_cwlap_ans_line(FAR char *ptr,
-                                         FAR struct iw_point *iwp)
+static int esp8266_parse_cwlap_ans_line(char *ptr,
+                                         struct iw_point *iwp)
 {
   /* For scan results, we store raw line text into the scan buffer.
    * The upper half wireless handler will parse it further.
@@ -1011,9 +1011,9 @@ static int esp8266_parse_cwlap_ans_line(FAR char *ptr,
  * Name: esp8266_ifup
  ****************************************************************************/
 
-static int esp8266_ifup(FAR struct netdev_lowerhalf_s *dev)
+static int esp8266_ifup(struct netdev_lowerhalf_s *dev)
 {
-  FAR struct esp8266_lowerhalf_s *priv = esp8266_priv(dev);
+  struct esp8266_lowerhalf_s *priv = esp8266_priv(dev);
   in_addr_t ip;
   char mac_str[18];
   int ret;
@@ -1073,7 +1073,7 @@ static int esp8266_ifup(FAR struct netdev_lowerhalf_s *dev)
       if (ret >= 0)
         {
           /* Response format: +CIPSTAMAC_CUR:"aa:bb:cc:dd:ee:ff" */
-          FAR char *p = strchr(priv->bufans, '"');
+          char *p = strchr(priv->bufans, '"');
           if (p != NULL)
             {
               p++;
@@ -1108,9 +1108,9 @@ static int esp8266_ifup(FAR struct netdev_lowerhalf_s *dev)
  * Name: esp8266_ifdown
  ****************************************************************************/
 
-static int esp8266_ifdown(FAR struct netdev_lowerhalf_s *dev)
+static int esp8266_ifdown(struct netdev_lowerhalf_s *dev)
 {
-  FAR struct esp8266_lowerhalf_s *priv = esp8266_priv(dev);
+  struct esp8266_lowerhalf_s *priv = esp8266_priv(dev);
   int i;
 
   if (!priv->ifup)
@@ -1151,14 +1151,14 @@ static int esp8266_ifdown(FAR struct netdev_lowerhalf_s *dev)
  *
  ****************************************************************************/
 
-static int esp8266_transmit(FAR struct netdev_lowerhalf_s *dev,
-                             FAR netpkt_t *pkt)
+static int esp8266_transmit(struct netdev_lowerhalf_s *dev,
+                             netpkt_t *pkt)
 {
-  FAR struct esp8266_lowerhalf_s *priv = esp8266_priv(dev);
+  struct esp8266_lowerhalf_s *priv = esp8266_priv(dev);
   int sockfd;
   int len;
   int ret;
-  FAR uint8_t *data;
+  uint8_t *data;
   struct esp8266_socket_s *sock;
 
   if (!priv->ifup)
@@ -1229,15 +1229,15 @@ static int esp8266_transmit(FAR struct netdev_lowerhalf_s *dev,
  * Name: esp8266_receive
  ****************************************************************************/
 
-static FAR netpkt_t *esp8266_receive(FAR struct netdev_lowerhalf_s *dev)
+static netpkt_t *esp8266_receive(struct netdev_lowerhalf_s *dev)
 {
-  FAR struct esp8266_lowerhalf_s *priv = esp8266_priv(dev);
-  FAR netpkt_t *pkt;
+  struct esp8266_lowerhalf_s *priv = esp8266_priv(dev);
+  netpkt_t *pkt;
   irqstate_t flags;
 
   flags = spin_lock_irqsave(&priv->rxlock);
   {
-    FAR struct esp8266_rxnode_s *node = priv->rxhead;
+    struct esp8266_rxnode_s *node = priv->rxhead;
     if (node != NULL)
       {
         pkt = node->pkt;
@@ -1262,7 +1262,7 @@ static FAR netpkt_t *esp8266_receive(FAR struct netdev_lowerhalf_s *dev)
  * Name: esp8266_reclaim
  ****************************************************************************/
 
-static void esp8266_reclaim(FAR struct netdev_lowerhalf_s *dev)
+static void esp8266_reclaim(struct netdev_lowerhalf_s *dev)
 {
   /* TX packets are freed in esp8266_transmit, nothing to do here */
 
@@ -1279,9 +1279,9 @@ static void esp8266_reclaim(FAR struct netdev_lowerhalf_s *dev)
  * Name: esp8266_iw_connect
  ****************************************************************************/
 
-static int esp8266_iw_connect(FAR struct netdev_lowerhalf_s *dev)
+static int esp8266_iw_connect(struct netdev_lowerhalf_s *dev)
 {
-  FAR struct esp8266_lowerhalf_s *priv = esp8266_priv(dev);
+  struct esp8266_lowerhalf_s *priv = esp8266_priv(dev);
 
   /* Wi-Fi connection is initiated via the essid/passwd set + ifup flow.
    * This op triggers the actual connection if configured.
@@ -1295,9 +1295,9 @@ static int esp8266_iw_connect(FAR struct netdev_lowerhalf_s *dev)
  * Name: esp8266_iw_disconnect
  ****************************************************************************/
 
-static int esp8266_iw_disconnect(FAR struct netdev_lowerhalf_s *dev)
+static int esp8266_iw_disconnect(struct netdev_lowerhalf_s *dev)
 {
-  FAR struct esp8266_lowerhalf_s *priv = esp8266_priv(dev);
+  struct esp8266_lowerhalf_s *priv = esp8266_priv(dev);
   int ret;
 
   ret = esp8266_ask_ans_ok(priv, ESP8266_TIMEOUT_MS, "AT+CWQAP\r\n");
@@ -1313,10 +1313,10 @@ static int esp8266_iw_disconnect(FAR struct netdev_lowerhalf_s *dev)
  * Name: esp8266_iw_essid (set/get)
  ****************************************************************************/
 
-static int esp8266_iw_essid(FAR struct netdev_lowerhalf_s *dev,
-                             FAR struct iwreq *iwr, bool set)
+static int esp8266_iw_essid(struct netdev_lowerhalf_s *dev,
+                             struct iwreq *iwr, bool set)
 {
-  FAR struct esp8266_lowerhalf_s *priv = esp8266_priv(dev);
+  struct esp8266_lowerhalf_s *priv = esp8266_priv(dev);
   int ret;
 
   if (set)
@@ -1325,7 +1325,7 @@ static int esp8266_iw_essid(FAR struct netdev_lowerhalf_s *dev,
        * esp8266_iw_connect or esp8266_ifup.
        */
 
-      FAR struct iw_point *iwp = &iwr->u.essid;
+      struct iw_point *iwp = &iwr->u.essid;
 
       iwp->flags = 0;
       return OK;
@@ -1334,7 +1334,7 @@ static int esp8266_iw_essid(FAR struct netdev_lowerhalf_s *dev,
     {
       /* Get: query current AP via AT+CWJAP_CUR? */
 
-      FAR struct iw_point *iwp = &iwr->u.essid;
+      struct iw_point *iwp = &iwr->u.essid;
 
       ret = esp8266_check(priv);
       if (ret < 0) return ret;
@@ -1356,8 +1356,8 @@ static int esp8266_iw_essid(FAR struct netdev_lowerhalf_s *dev,
  * Name: esp8266_iw_bssid (set/get)
  ****************************************************************************/
 
-static int esp8266_iw_bssid(FAR struct netdev_lowerhalf_s *dev,
-                             FAR struct iwreq *iwr, bool set)
+static int esp8266_iw_bssid(struct netdev_lowerhalf_s *dev,
+                             struct iwreq *iwr, bool set)
 {
   /* BSSID set: not typically used for ESP8266 (connect via SSID).
    * BSSID get: extracted from +CWJAP? response during essid get.
@@ -1374,8 +1374,8 @@ static int esp8266_iw_bssid(FAR struct netdev_lowerhalf_s *dev,
        * We re-query here for simplicity.
        */
 
-      FAR struct esp8266_lowerhalf_s *priv = esp8266_priv(dev);
-      FAR struct sockaddr *ap = &iwr->u.ap_addr;
+      struct esp8266_lowerhalf_s *priv = esp8266_priv(dev);
+      struct sockaddr *ap = &iwr->u.ap_addr;
       int ret;
 
       ret = esp8266_check(priv);
@@ -1388,7 +1388,7 @@ static int esp8266_iw_bssid(FAR struct netdev_lowerhalf_s *dev,
       if (ret < 0) return ret;
 
       /* Parse BSSID (field 2 of +CWJAP:) */
-      FAR char *p = priv->bufans;
+      char *p = priv->bufans;
       int i;
 
       /* Skip to BSSID field */
@@ -1421,8 +1421,8 @@ static int esp8266_iw_bssid(FAR struct netdev_lowerhalf_s *dev,
  * Name: esp8266_iw_passwd (set/get)
  ****************************************************************************/
 
-static int esp8266_iw_passwd(FAR struct netdev_lowerhalf_s *dev,
-                              FAR struct iwreq *iwr, bool set)
+static int esp8266_iw_passwd(struct netdev_lowerhalf_s *dev,
+                              struct iwreq *iwr, bool set)
 {
   /* get: password is not retrievable from ESP8266.
    * set: store password for later connect.
@@ -1443,11 +1443,11 @@ static int esp8266_iw_passwd(FAR struct netdev_lowerhalf_s *dev,
  * Name: esp8266_iw_scan
  ****************************************************************************/
 
-static int esp8266_iw_scan(FAR struct netdev_lowerhalf_s *dev,
-                            FAR struct iwreq *iwr, bool set)
+static int esp8266_iw_scan(struct netdev_lowerhalf_s *dev,
+                            struct iwreq *iwr, bool set)
 {
-  FAR struct esp8266_lowerhalf_s *priv = esp8266_priv(dev);
-  FAR struct iw_point *iwp;
+  struct esp8266_lowerhalf_s *priv = esp8266_priv(dev);
+  struct iw_point *iwp;
   int ret;
 
   if (set)
@@ -1516,10 +1516,10 @@ static int esp8266_iw_scan(FAR struct netdev_lowerhalf_s *dev,
  *
  ****************************************************************************/
 
-int esp8266_netdev_register(FAR const char *uart_dev)
+int esp8266_netdev_register(const char *uart_dev)
 {
-  FAR struct esp8266_lowerhalf_s *priv;
-  FAR char *argv[2];
+  struct esp8266_lowerhalf_s *priv;
+  char *argv[2];
   char argbuf[32];
   int ret;
   int i;
