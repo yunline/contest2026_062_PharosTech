@@ -13,4 +13,5 @@
 if(CONFIG_ESP8266_NETDEV)
   target_sources(drivers PRIVATE esp8266_netdev.c)
   target_include_directories(drivers PRIVATE ${CMAKE_CURRENT_LIST_DIR})
+  target_include_directories(board PRIVATE ${CMAKE_CURRENT_LIST_DIR})
 endif()

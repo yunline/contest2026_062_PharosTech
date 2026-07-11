@@ -1,0 +1,10 @@
+#
+# For a description of the syntax of this configuration file,
+# see the file kconfig-language.txt in the NuttX tools repository.
+#
+
+menu "K7 Drivers"
+
+source "net/esp8266/Kconfig"
+
+endmenu # K7 Drivers
