@@ -41,6 +41,10 @@
 #include "arm64_smp.h"
 #endif
 
+#ifdef CONFIG_ARCH_HAVE_MULTICPU
+#include "arm64_cpu_psci.h"
+#endif
+
 #include "arm64_arch.h"
 #include "arm64_internal.h"
 #include "arm64_mmu.h"
@@ -159,3 +163,33 @@ void arm64_addregion(void)
   kumm_addregion((void *)CONFIG_RAMBANK2_ADDR, CONFIG_RAMBANK2_SIZE);
 }
 #endif
+
+#ifdef CONFIG_ARCH_HAVE_MULTICPU
+
+/****************************************************************************
+ * Name: arm64_get_mpid
+ *
+ * Description:
+ *   Convert logical CPU index to MPIDR_EL1 value for PSCI cpu_on.
+ *   RK3576 has 4 Cortex-A53 cores in a single cluster with Aff0=0..3.
+ *
+ ****************************************************************************/
+
+uint64_t arm64_get_mpid(int cpu)
+{
+  return CORE_TO_MPID(cpu, 0);
+}
+
+/****************************************************************************
+ * Name: arm64_get_cpuid
+ *
+ * Description:
+ *   Convert MPIDR_EL1 value back to logical CPU index.
+ *
+ ****************************************************************************/
+
+int arm64_get_cpuid(uint64_t mpid)
+{
+  return MPID_TO_CORE(mpid);
+}
+#endif /* CONFIG_ARCH_HAVE_MULTICPU */
