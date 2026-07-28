@@ -21,7 +21,7 @@ env:
   OPENVELA_DIR: openvela
 
 jobs:
-  # 扫描 defconfig，生成 build matrix（与 sync 并行）
+  # 扫描 defconfig，生成 build matrix
   scan_configs:
     name: Scan Configs
     runs-on: ubuntu-latest
@@ -53,6 +53,19 @@ jobs:
         include: ${{ fromJson(needs.scan_configs.outputs.matrix) }}
 
     steps:
+      # 生成 artifact 名称 slug
+      - name: Generate config slug
+        run: |
+          SLUG="${{ matrix.config }}"
+          echo "CONFIG_SLUG=${SLUG//\//_}" >> "$GITHUB_ENV"
+
+      # 安装构建依赖
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            git curl cmake python3 libc++abi-dev build-essential
+
       # 安装 repo 工具
       - name: Install repo
         run: |
@@ -73,18 +86,13 @@ jobs:
             --depth=1
           repo sync -c -j4
 
-      # 生成 artifact 名称 slug
-      - name: Generate config slug
+      # Checkout 到 PR 分支（repo sync 拉下的是默认分支）
+      - name: Checkout contest repo to PR branch
         run: |
-          SLUG="${{ matrix.config }}"
-          echo "CONFIG_SLUG=${SLUG//\//_}" >> "$GITHUB_ENV"
-
-      # 安装构建依赖
-      - name: Install build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            git curl cmake python3 libc++abi-dev build-essential
+          cd ${{ env.OPENVELA_DIR }}/${{ env.REPO_NAME }}
+          git remote add ci "${{ env.MANIFEST_REPO }}" || true
+          git fetch ci ${{ env.MANIFEST_BRANCH }}
+          git checkout FETCH_HEAD
 
       # CMake 构建
       - name: Build (CMake)
