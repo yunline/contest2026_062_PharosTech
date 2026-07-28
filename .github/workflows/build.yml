@@ -1,0 +1,188 @@
+name: build
+
+on:
+  push:
+    branches: [dev-ai-contest-2026]
+  pull_request:
+    branches: [dev-ai-contest-2026]
+
+  # 允许手动触发
+  workflow_dispatch:
+
+env:
+  # manifest 仓库：始终使用触发 workflow 的仓库（fork 友好）
+  MANIFEST_REPO: ${{ github.server_url }}/${{ github.repository }}
+  # PR 事件中 github.ref_name 是 "1/merge"，需取 head.ref 获取真实分支名
+  MANIFEST_BRANCH: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.ref || github.ref_name }}
+  # 仓库名即 manifest 文件名
+  REPO_NAME: ${{ github.event.repository.name }}
+  MANIFEST_FILE: ${{ github.event.repository.name }}.xml
+  # repo sync 的工作目录（workspace 下的 openvela 子目录）
+  OPENVELA_DIR: openvela
+
+jobs:
+  # 扫描 defconfig，生成 build matrix（与 sync 并行）
+  scan_configs:
+    name: Scan Configs
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Scan configs
+        id: matrix
+        run: |
+          CONFIGS='[]'
+          for cfg in $(find "boards" "configs" -name defconfig -printf '%h\n' | sort); do
+            CONFIGS=$(echo "$CONFIGS" | jq -c --arg c "$cfg" '. + [{"config": $c}]')
+          done
+          echo "matrix=$CONFIGS" >> $GITHUB_OUTPUT
+          echo "Discovered configs: $CONFIGS"
+
+  # 拉取 openvela 全量源码（与 scan 并行）
+  sync:
+    name: Repo Sync
+    runs-on: ubuntu-latest
+
+    outputs:
+      cache_key: ${{ steps.key.outputs.cache_key }}
+
+    steps:
+      # Checkout 本仓库（仅用于获取 manifest 文件）
+      - name: Checkout manifest repo
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            ${{ env.MANIFEST_FILE }}
+            openvela.xml
+          sparse-checkout-cone-mode: false
+
+      # 计算缓存 key 并输出给 build job
+      - name: Compute cache key
+        id: key
+        run: |
+          KEY="openvela-sync-${{ hashFiles(env.MANIFEST_FILE, 'openvela.xml') }}"
+          echo "cache_key=$KEY" >> $GITHUB_OUTPUT
+          echo "Cache key: $KEY"
+
+      # 检查缓存是否存在（不下载，只看 key）
+      - name: Check cache exists
+        id: cache_check
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ env.OPENVELA_DIR }}
+          key: ${{ steps.key.outputs.cache_key }}
+          lookup-only: true
+
+      # 缓存未命中时：安装 repo -> init & sync -> 保存缓存
+      - name: Install repo
+        if: steps.cache_check.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/bin
+          curl -s https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
+          chmod a+x ~/bin/repo
+          echo "$HOME/bin" >> $GITHUB_PATH
+
+      - name: Repo init & sync
+        if: steps.cache_check.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ${{ env.OPENVELA_DIR }}
+          cd ${{ env.OPENVELA_DIR }}
+          repo init \
+            -u "${{ env.MANIFEST_REPO }}" \
+            -b "${{ env.MANIFEST_BRANCH }}" \
+            -m "${{ env.MANIFEST_FILE }}" \
+            --depth=1
+          repo sync -c --no-tags --optimized-fetch --fetch-submodules -j4
+
+      - name: Save openvela source cache
+        if: steps.cache_check.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ env.OPENVELA_DIR }}
+          key: ${{ steps.key.outputs.cache_key }}
+
+  # 并行构建所有配置
+  build:
+    name: Build (${{ matrix.config }})
+    needs: [scan_configs, sync]
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.scan_configs.outputs.matrix) }}
+
+    steps:
+      # 恢复 openvela 源码缓存（key 由 sync job 传入）
+      - name: Restore openvela source cache
+        uses: actions/cache@v6
+        with:
+          path: ${{ env.OPENVELA_DIR }}
+          key: ${{ needs.sync.outputs.cache_key }}
+          restore-keys: |
+            openvela-sync-
+          fail-on-cache-miss: true
+
+      # Checkout 到 PR 分支（覆盖缓存中的默认分支）
+      - name: Checkout contest repo to PR branch
+        run: |
+          cd ${{ env.OPENVELA_DIR }}/${{ env.REPO_NAME }}
+          git remote add ci "${{ env.MANIFEST_REPO }}" || true
+          git fetch ci ${{ env.MANIFEST_BRANCH }}
+          git checkout FETCH_HEAD
+
+      # 生成 artifact 名称 slug
+      - name: Generate config slug
+        run: |
+          SLUG="${{ matrix.config }}"
+          echo "CONFIG_SLUG=${SLUG//\//_}" >> "$GITHUB_ENV"
+
+      # 安装构建依赖
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            git curl cmake python3 libc++abi-dev build-essential
+
+      # CMake 构建
+      - name: Build (CMake)
+        id: cmake_build
+        continue-on-error: true
+        run: |
+          cd ${{ env.OPENVELA_DIR }}
+          ./build.sh ${{ env.REPO_NAME }}/${{ matrix.config }} --cmake
+
+      - name: Upload CMake artifact
+        if: steps.cmake_build.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.CONFIG_SLUG }}-cmake
+          path: ${{ env.OPENVELA_DIR }}/cmake_out/**/nuttx.bin
+          if-no-files-found: warn
+
+      # Makefile 构建
+      - name: Build (Makefile)
+        id: make_build
+        continue-on-error: true
+        run: |
+          cd ${{ env.OPENVELA_DIR }}
+          ./build.sh ${{ env.REPO_NAME }}/${{ matrix.config }} distclean
+          ./build.sh ${{ env.REPO_NAME }}/${{ matrix.config }} -j4
+
+      - name: Upload Makefile artifact
+        if: steps.make_build.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.CONFIG_SLUG }}-makefile
+          path: ${{ env.OPENVELA_DIR }}/nuttx/nuttx.bin
+          if-no-files-found: warn
+
+      # 任一构建失败则 job 失败
+      - name: Check build results
+        if: steps.cmake_build.outcome == 'failure' || steps.make_build.outcome == 'failure'
+        run: |
+          echo "::error::CMake outcome: ${{ steps.cmake_build.outcome }}, Makefile outcome: ${{ steps.make_build.outcome }}"
+          exit 1
