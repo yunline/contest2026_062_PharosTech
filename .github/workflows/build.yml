@@ -41,73 +41,10 @@ jobs:
           echo "matrix=$CONFIGS" >> $GITHUB_OUTPUT
           echo "Discovered configs: $CONFIGS"
 
-  # 拉取 openvela 全量源码（与 scan 并行）
-  sync:
-    name: Repo Sync
-    runs-on: ubuntu-latest
-
-    outputs:
-      cache_key: ${{ steps.key.outputs.cache_key }}
-
-    steps:
-      # Checkout 本仓库（仅用于获取 manifest 文件）
-      - name: Checkout manifest repo
-        uses: actions/checkout@v4
-        with:
-          sparse-checkout: |
-            ${{ env.MANIFEST_FILE }}
-            openvela.xml
-          sparse-checkout-cone-mode: false
-
-      # 计算缓存 key 并输出给 build job
-      - name: Compute cache key
-        id: key
-        run: |
-          KEY="openvela-sync-${{ hashFiles(env.MANIFEST_FILE, 'openvela.xml') }}"
-          echo "cache_key=$KEY" >> $GITHUB_OUTPUT
-          echo "Cache key: $KEY"
- 
-      # 检查缓存是否存在（不下载，只看 key）
-      - name: Check cache exists
-        id: cache_check
-        uses: actions/cache/restore@v6
-        with:
-          path: ${{ env.OPENVELA_DIR }}
-          key: ${{ steps.key.outputs.cache_key }}
-          lookup-only: true
-
-      # 缓存未命中时：安装 repo -> init & sync -> 保存缓存
-      - name: Install repo
-        if: steps.cache_check.outputs.cache-hit != 'true'
-        run: |
-          mkdir -p ~/bin
-          curl -s https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
-          chmod a+x ~/bin/repo
-          echo "$HOME/bin" >> $GITHUB_PATH
-
-      - name: Repo init & sync
-        if: steps.cache_check.outputs.cache-hit != 'true'
-        run: |
-          mkdir -p ${{ env.OPENVELA_DIR }}
-          cd ${{ env.OPENVELA_DIR }}
-          repo init \
-            -u "${{ env.MANIFEST_REPO }}" \
-            -b "${{ env.MANIFEST_BRANCH }}" \
-            -m "${{ env.MANIFEST_FILE }}" \
-            --depth=1
-          repo sync -c --no-tags --optimized-fetch --fetch-submodules -j4
-
-      - name: Save openvela source cache
-        if: steps.cache_check.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v6
-        with:
-          path: ${{ env.OPENVELA_DIR }}
-          key: ${{ steps.key.outputs.cache_key }}
-
   # 并行构建所有配置
   build:
     name: Build (${{ matrix.config }})
-    needs: [scan_configs, sync]
+    needs: scan_configs
     runs-on: ubuntu-latest
 
     strategy:
@@ -116,23 +53,25 @@ jobs:
         include: ${{ fromJson(needs.scan_configs.outputs.matrix) }}
 
     steps:
-      # 恢复 openvela 源码缓存（key 由 sync job 传入）
-      - name: Restore openvela source cache
-        uses: actions/cache@v6
-        with:
-          path: ${{ env.OPENVELA_DIR }}
-          key: ${{ needs.sync.outputs.cache_key }}
-          restore-keys: |
-            openvela-sync-
-          fail-on-cache-miss: true
-
-      # Checkout 到 PR 分支（覆盖缓存中的默认分支）
-      - name: Checkout contest repo to PR branch
+      # 安装 repo 工具
+      - name: Install repo
         run: |
-          cd ${{ env.OPENVELA_DIR }}/${{ env.REPO_NAME }}
-          git remote add ci "${{ env.MANIFEST_REPO }}" || true
-          git fetch ci ${{ env.MANIFEST_BRANCH }}
-          git checkout FETCH_HEAD
+          mkdir -p ~/bin
+          curl -s https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
+          chmod a+x ~/bin/repo
+          echo "$HOME/bin" >> $GITHUB_PATH
+
+      # 拉取 openvela 全量源码
+      - name: Repo init & sync
+        run: |
+          mkdir -p ${{ env.OPENVELA_DIR }}
+          cd ${{ env.OPENVELA_DIR }}
+          repo init \
+            -u "${{ env.MANIFEST_REPO }}" \
+            -b "${{ env.MANIFEST_BRANCH }}" \
+            -m "${{ env.MANIFEST_FILE }}" \
+            --depth=1
+          repo sync -c -j4
 
       # 生成 artifact 名称 slug
       - name: Generate config slug
