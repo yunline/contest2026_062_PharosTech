@@ -66,7 +66,7 @@ jobs:
           KEY="openvela-sync-${{ hashFiles(env.MANIFEST_FILE, 'openvela.xml') }}"
           echo "cache_key=$KEY" >> $GITHUB_OUTPUT
           echo "Cache key: $KEY"
-
+ 
       # 检查缓存是否存在（不下载，只看 key）
       - name: Check cache exists
         id: cache_check
