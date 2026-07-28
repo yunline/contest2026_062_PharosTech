@@ -27,3 +27,15 @@
 # 或者使用cmake
 ./build.sh contest2026_062_PharosTech/configs/dev --cmake
 ```
+## 注意事项
+
+### 新增配置时务必创建 Make.defs 软链接
+
+Makefile 模式下，`configure.sh` 会在配置目录中查找 `Make.defs`。由于本目录位于 `boards/` 之外，必须手动创建指向板级 `scripts/Make.defs` 的符号链接，否则 Makefile 模式编译会报错 `File Make.defs could not be found`。
+
+```bash
+# 在新建的配置目录中创建软链接
+ln -s ../../boards/rk3576/kickpi-k7/scripts/Make.defs configs/<新配置名>/Make.defs
+```
+
+CMake 模式不需要此链接，但 Makefile 模式必须有。
