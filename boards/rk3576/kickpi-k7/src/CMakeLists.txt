@@ -29,9 +29,9 @@ endif()
 # ESP8266/ESP01 netdev driver (linked from contest repo via manifest)
 if(CONFIG_ESP8266_NETDEV)
   target_sources(board PRIVATE
-    ${CMAKE_SOURCE_DIR}/../drivers/net/esp8266/esp8266_netdev.c
+    ${CMAKE_SOURCE_DIR}/../vendor/k7drivers/net/esp8266/esp8266_netdev.c
   )
   target_include_directories(board PRIVATE
-    ${CMAKE_SOURCE_DIR}/../drivers/net/esp8266
+    ${CMAKE_SOURCE_DIR}/../vendor/k7drivers/net/esp8266
   )
 endif()

@@ -41,8 +41,8 @@ endif
 # ESP8266/ESP01 netdev driver (linked from contest repo via manifest)
 ifeq ($(CONFIG_ESP8266_NETDEV),y)
   CSRCS += esp8266_netdev.c
-  CFLAGS += ${INCDIR_PREFIX}$(TOPDIR)/../drivers/net/esp8266
-  VPATH += :$(TOPDIR)/../drivers/net/esp8266
+  CFLAGS += ${INCDIR_PREFIX}$(TOPDIR)/../vendor/k7drivers/net/esp8266
+  VPATH += :$(TOPDIR)/../vendor/k7drivers/net/esp8266
 endif
 
 include $(TOPDIR)/boards/Board.mk
