@@ -769,9 +769,19 @@ static int esp8266_worker(int argc, char *argv[])
                     }
                 }
 
+              /* Release the spinlock BEFORE posting the semaphore.
+               * nxsem_post() may cause an immediate context switch to a
+               * higher-priority thread waiting in esp8266_read().  If that
+               * thread then tries spin_lock_irqsave(&worker.lock) while
+               * we still hold it, we get a priority-inversion deadlock
+               * because spin_lock_irqsave disables interrupts on this CPU.
+               */
+
+              spin_unlock_irqrestore(&priv->worker.lock, flags);
               nxsem_post(&priv->worker.sem);
               priv->worker.rxbuf[0] = '\0';
               rxlen = 0;
+              flags = spin_lock_irqsave(&priv->worker.lock);
             }
         }
       else if (rxlen < BUF_WORKER_LEN - 1)
