@@ -29,6 +29,7 @@
 #ifdef CONFIG_ESP8266_NETDEV
 
 #include <stdint.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -39,6 +40,8 @@
 #include <time.h>
 
 #include <arpa/inet.h>
+
+#include <net/if_arp.h>
 
 #include <nuttx/clock.h>
 #include <nuttx/kmalloc.h>
@@ -132,10 +135,12 @@ esp8266_str_to_unsigned(char **p_ptr, char end);
 /* AT response parsers */
 static int  esp8266_parse_cwjap_ans_line(char *ptr,
                                          struct iw_point *iwp);
-static int  esp8266_parse_cwlap_ans_line(char *ptr,
-                                         struct iw_point *iwp);
+static int  esp8266_parse_cwlap_to_ap(char *line,
+                                       struct esp8266_ap_s *ap);
 static int  esp8266_parse_cipxxx_ans_line(const char *ptr,
                                           in_addr_t *ip);
+static int  esp8266_serialize_scan_events(struct esp8266_lowerhalf_s *priv,
+                                           struct iw_point *iwp);
 
 /* netdev_lowerhalf ops */
 static int  esp8266_ifup(struct netdev_lowerhalf_s *dev);
@@ -983,32 +988,284 @@ static int esp8266_parse_cwjap_ans_line(char *ptr,
  *
  ****************************************************************************/
 
-static int esp8266_parse_cwlap_ans_line(char *ptr,
-                                         struct iw_point *iwp)
-{
-  /* For scan results, we store raw line text into the scan buffer.
-   * The upper half wireless handler will parse it further.
-   * We copy the line into iwp->pointer (if space available).
-   */
+/****************************************************************************
+ * Name: esp8266_parse_cwlap_to_ap
+ *
+ * Description:
+ *   Parse +CWLAP:(ecn,"SSID",RSSI,"BSSID",channel,...)
+ *   into a struct esp8266_ap_s.
+ *
+ *   Example: +CWLAP:(3,"CMCC-501",-60,"30:1f:48:6e:f9:7e",6,10,0)
+ *            ecn=3  SSID="CMCC-501"  RSSI=-60  BSSID=30:1f:48:6e:f9:7e
+ *            channel=6  offset=10  calibrate=0 (ignored)
+ *
+ ****************************************************************************/
 
+static int esp8266_parse_cwlap_to_ap(char *line,
+                                      struct esp8266_ap_s *ap)
+{
+  char *p;
+  char *start;
+  char *end;
   int len;
 
-  if (iwp == NULL || iwp->pointer == NULL)
+  /* Skip "+CWLAP:" prefix (already verified by caller) */
+
+  p = line;
+  if (strncmp(p, "+CWLAP:", 7) != 0)
     {
-      return 0;
+      return -1;
     }
 
-  len = strlen(ptr);
-  if (len + 1 > iwp->length)
+  p += 7;
+
+  /* Parse ecn: "(ecn," */
+
+  if (*p != '(')
     {
-      /* No space left */
-      return -ENOSPC;
+      return -1;
     }
 
-  memcpy(iwp->pointer, ptr, len + 1);
-  iwp->pointer += len + 1;
-  iwp->length -= len + 1;
-  iwp->flags++;
+  p++;
+  ap->ecn = (uint8_t)strtoul(p, &p, 10);
+
+  /* Skip comma */
+
+  if (*p != ',')
+    {
+      return -1;
+    }
+
+  p++;
+
+  /* Parse SSID: "SSID", — may contain commas inside quotes */
+
+  if (*p != '"')
+    {
+      return -1;
+    }
+
+  p++;
+  start = p;
+
+  /* Find closing '"' — scan forward to find the right quote followed by ',' */
+
+  while (*p != '\0')
+    {
+      if (*p == '"')
+        {
+          p++;
+          if (*p == ',')
+            {
+              break;
+            }
+        }
+      else
+        {
+          p++;
+        }
+    }
+
+  if (*p != ',')
+    {
+      return -1;
+    }
+
+  end = p - 1;  /* point to closing '"' */
+  *end = '\0';
+
+  len = end - start;
+  if (len > 32)
+    {
+      len = 32;
+    }
+
+  memcpy(ap->essid, start, len);
+  ap->essid[len] = '\0';
+
+  /* Restore the line (optional, but good practice) */
+
+  *end = '"';
+
+  p++;  /* skip ',' after closing quote */
+
+  /* Parse RSSI */
+
+  ap->rssi = (int8_t)strtol(p, &p, 10);
+
+  /* Skip comma */
+
+  if (*p != ',')
+    {
+      return -1;
+    }
+
+  p++;
+
+  /* Parse BSSID: "xx:xx:xx:xx:xx:xx" */
+
+  if (*p != '"')
+    {
+      return -1;
+    }
+
+  p++;
+
+  if (sscanf(p, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
+             &ap->bssid[0], &ap->bssid[1], &ap->bssid[2],
+             &ap->bssid[3], &ap->bssid[4], &ap->bssid[5]) != 6)
+    {
+      return -1;
+    }
+
+  /* Skip past BSSID to find channel after next comma */
+
+  p = strchr(p, ',');
+  if (p == NULL)
+    {
+      return -1;
+    }
+
+  p++;  /* skip ',' */
+
+  /* Parse channel */
+
+  ap->channel = (uint8_t)strtoul(p, NULL, 10);
+
+  return 0;
+}
+
+/****************************************************************************
+ * Name: esp8266_serialize_scan_events
+ *
+ * Description:
+ *   Serialize the cached AP list into the iw event stream format
+ *   expected by wapi_scan_coll.  Each AP becomes a sequence of
+ *   iw_event structs: SIOCGIWAP, SIOCGIWFREQ, IWEVQUAL, SIOCGIWESSID.
+ *
+ *   Event stream layout (for each AP):
+ *     struct iw_event (cmd=SIOCGIWAP,    len=sizeof(iw_event))
+ *     struct iw_event (cmd=SIOCGIWFREQ,  len=sizeof(iw_event))
+ *     struct iw_event (cmd=IWEVQUAL,     len=sizeof(iw_event))
+ *     struct iw_event (cmd=SIOCGIWESSID, len=offsetof(iw_event,u) + sizeof(iw_point))
+ *       + followed by SSID string (len = essid_len)
+ *
+ ****************************************************************************/
+
+static int esp8266_serialize_scan_events(struct esp8266_lowerhalf_s *priv,
+                                          struct iw_point *iwp)
+{
+  FAR uint8_t *buf = (FAR uint8_t *)iwp->pointer;
+  uint32_t remaining = iwp->length;
+  uint32_t offset = 0;
+  int i;
+
+  /* Size of a "plain" event (no trailing variable-length data) */
+
+  const uint32_t ev_plain_len = sizeof(struct iw_event);
+
+  /* Size of the fixed header of a pointer-type event
+   * (SIOCGIWESSID etc.) — the SSID string follows right after.
+   */
+
+  const uint32_t ev_point_hdr = offsetof(struct iw_event, u)
+                                + sizeof(struct iw_point);
+
+  iwp->flags = 0;
+
+  /* Zero-length probe (wapi_scan_stat polling): just set flags
+   * to the AP count and return OK.  Do not touch the buffer.
+   */
+
+  if (remaining == 0 && priv->scan_count > 0)
+    {
+      iwp->flags = priv->scan_count;
+      return OK;
+    }
+
+  for (i = 0; i < priv->scan_count; i++)
+    {
+      struct esp8266_ap_s *ap = &priv->scan_aps[i];
+      struct iw_event iwe;
+      uint32_t needed;
+      uint8_t essid_len;
+
+      essid_len = strlen(ap->essid);
+
+      /* Calculate total space needed for this AP's events */
+
+      needed  = ev_plain_len;                        /* SIOCGIWAP */
+      needed += ev_plain_len;                        /* SIOCGIWFREQ */
+      needed += ev_plain_len;                        /* IWEVQUAL */
+      needed += ev_point_hdr + essid_len;            /* SIOCGIWESSID + string */
+
+      if (offset + needed > remaining)
+        {
+          return -ENOSPC;
+        }
+
+      /* Event 1: SIOCGIWAP (BSSID) */
+
+      iwe.len = ev_plain_len;
+      iwe.cmd = SIOCGIWAP;
+      memcpy(iwe.u.ap_addr.sa_data, ap->bssid, ESP8266_MAC_LEN);
+      iwe.u.ap_addr.sa_family = ARPHRD_ETHER;
+      memcpy(buf + offset, &iwe, ev_plain_len);
+      offset += ev_plain_len;
+
+      /* Event 2: SIOCGIWFREQ (channel coded as freq.m, e=0) */
+
+      iwe.len = ev_plain_len;
+      iwe.cmd = SIOCGIWFREQ;
+      iwe.u.freq.m = ap->channel;
+      iwe.u.freq.e = 0;  /* 0 means "channel number" not "Hz" */
+      memcpy(buf + offset, &iwe, ev_plain_len);
+      offset += ev_plain_len;
+
+      /* Event 3: IWEVQUAL (RSSI in dBm) */
+
+      iwe.len = ev_plain_len;
+      iwe.cmd = IWEVQUAL;
+      iwe.u.qual.qual     = 0;
+      iwe.u.qual.level    = (uint8_t)ap->rssi;
+      iwe.u.qual.noise    = 0;
+      iwe.u.qual.updated  = IW_QUAL_LEVEL_UPDATED | IW_QUAL_DBM;
+      memcpy(buf + offset, &iwe, ev_plain_len);
+      offset += ev_plain_len;
+
+      /* Event 4: SIOCGIWESSID (pointer to following string data)
+       *
+       * Layout in stream:
+       *   [struct iw_event header: len/cmd/u.data.flags/u.data.length/u.data.pointer]
+       *   [SSID bytes]
+       *
+       * u.data.pointer is the byte offset from &u.data to the SSID bytes.
+       * Since the SSID follows immediately after the fixed header, the
+       * offset is sizeof(struct iw_point).
+       */
+
+      iwe.len = ev_point_hdr + essid_len;
+      iwe.cmd = SIOCGIWESSID;
+      iwe.u.data.flags   = (essid_len > 0) ? 1 : 0;
+      iwe.u.data.length  = essid_len;
+      iwe.u.data.pointer = (FAR void *)(uintptr_t)sizeof(struct iw_point);
+      memcpy(buf + offset, &iwe, ev_point_hdr);
+      offset += ev_point_hdr;
+
+      /* Write SSID string after the event header */
+
+      if (essid_len > 0)
+        {
+          memcpy(buf + offset, ap->essid, essid_len);
+          offset += essid_len;
+        }
+
+      iwp->flags++;  /* Count of APs */
+    }
+
+  /* Update iwp->length to reflect actual bytes written */
+
+  iwp->length = offset;
 
   return 0;
 }
@@ -1462,23 +1719,12 @@ static int esp8266_iw_scan(struct netdev_lowerhalf_s *dev,
 
   if (set)
     {
-      /* Start scan: send AT+CWLAP */
+      /* Start scan: send AT+CWLAP, parse all results into cache */
 
-      ret = esp8266_check(priv);
-      if (ret < 0)
-        {
-          return ret;
-        }
+      int i;
 
-      ret = esp8266_ask_ans_ok(priv, ESP8266_TIMEOUT_SCAN, "AT+CWLAP\r\n");
-      return (ret >= 0) ? OK : ret;
-    }
-  else
-    {
-      /* Get scan results: read all +CWLAP lines */
-
-      iwp = &iwr->u.data;
-      iwp->flags = 0;
+      priv->scan_count = 0;
+      priv->scan_valid = false;
 
       ret = esp8266_check(priv);
       if (ret < 0)
@@ -1492,7 +1738,9 @@ static int esp8266_iw_scan(struct netdev_lowerhalf_s *dev,
           return ret;
         }
 
-      while (ret >= 0)
+      /* Read all +CWLAP lines and parse into the local AP cache */
+
+      while (ret >= 0 && priv->scan_count < ESP8266_SCAN_CACHE_MAX)
         {
           ret = esp8266_read(priv, ESP8266_TIMEOUT_SCAN);
           if (ret < 0)
@@ -1505,10 +1753,41 @@ static int esp8266_iw_scan(struct netdev_lowerhalf_s *dev,
               break;
             }
 
-          esp8266_parse_cwlap_ans_line(priv->bufans, iwp);
+          /* Parse +CWLAP:(ecn,"SSID",RSSI,"BSSID",channel,...) */
+
+          if (strncmp(priv->bufans, "+CWLAP:", 7) != 0)
+            {
+              continue;
+            }
+
+          i = priv->scan_count;
+          if (esp8266_parse_cwlap_to_ap(priv->bufans,
+                                         &priv->scan_aps[i]) == 0)
+            {
+              priv->scan_count++;
+            }
         }
 
+      priv->scan_valid = true;
       return OK;
+    }
+  else
+    {
+      /* Get scan results: serialize cached AP list as iw event stream.
+       * For zero-length probe (wapi_scan_stat polling), serialize_scan_events
+       * returns OK with flags=AP_count — wapi_scan_stat treats this as
+       * "data ready".  For a real data read, the events are written into
+       * the buffer; if the buffer is too small, -ENOSPC is returned.
+       */
+
+      iwp = &iwr->u.data;
+
+      if (!priv->scan_valid)
+        {
+          return -EAGAIN;
+        }
+
+      return esp8266_serialize_scan_events(priv, iwp);
     }
 }
 

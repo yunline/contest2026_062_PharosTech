@@ -48,6 +48,25 @@
 #define ESP8266_ANS_OK       1
 #define ESP8266_ANS_ERR      (-1)
 
+/* Maximum number of APs to cache from AT+CWLAP scan */
+
+#define ESP8266_SCAN_CACHE_MAX  32
+
+/****************************************************************************
+ * Public Types
+ ****************************************************************************/
+
+/* Parsed AP entry from +CWLAP:(ecn,"SSID",RSSI,"BSSID",channel) */
+
+struct esp8266_ap_s
+{
+  uint8_t  bssid[ESP8266_MAC_LEN];
+  char     essid[33];    /* Max 32 bytes + NUL */
+  int8_t   rssi;         /* dBm, e.g. -44 */
+  uint8_t  channel;      /* Wi-Fi channel number */
+  uint8_t  ecn;          /* Encryption: 0=open, 3=WPA2, 4=WPA/WPA2 */
+};
+
 /****************************************************************************
  * Public Types
  ****************************************************************************/
@@ -130,10 +149,11 @@ struct esp8266_lowerhalf_s
   bool               connected;  /* Wi-Fi associated */
   bool               ifup;
 
-  /* AP scan callback state */
+  /* AP scan cache: populated by AT+CWLAP on set=true, read by set=false */
 
-  struct iwreq  *scan_iwr;
-  sem_t              scan_sem;
+  struct esp8266_ap_s scan_aps[ESP8266_SCAN_CACHE_MAX];
+  uint8_t             scan_count;
+  bool                scan_valid;
 };
 
 /****************************************************************************
