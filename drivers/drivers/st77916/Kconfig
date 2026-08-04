@@ -1,0 +1,29 @@
+#
+# For a description of the syntax of this configuration file,
+# see the file kconfig-language.txt in the NuttX tools repository.
+#
+
+config LCD_ST77916
+    bool "ST77916 QSPI LCD driver"
+    default n
+    ---help---
+        Enable the ST77916 LCD driver.
+        The driver is compatible with any NuttX QSPI lower-half driver; the
+        board init code obtains the QSPI handle and passes it in.
+
+if LCD_ST77916
+
+config LCD_ST77916_SWAP_RGB565
+    bool "Byte-swap RGB565 pixel data before sending to the panel"
+    default y
+    ---help---
+        When enabled, RGB565 (16-bit) pixel data is byte-swapped while
+        being staged into the DMA buffer so the panel GRAM receives the
+        big-endian byte order it expects.  This is the default and is
+        implemented by st77916_rev16_cpy().
+
+        Disable this if the panel/board does not require the byte swap;
+        in that case st77916_rev16_cpy() simply forwards to memcpy() and
+        no endianness conversion is applied.
+
+endif # LCD_ST77916

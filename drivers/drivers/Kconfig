@@ -9,6 +9,6 @@ config NYABULA_CUSTOM_DRIVERS
 
 if NYABULA_CUSTOM_DRIVERS
 
-# TODO
+source "$BINDIR/drivers/platform/drivers/st77916/Kconfig"
 
 endif

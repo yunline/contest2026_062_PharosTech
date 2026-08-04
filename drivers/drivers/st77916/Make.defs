@@ -1,0 +1,16 @@
+############################################################################
+# boards/rk3576/drivers/drivers/st77916/Make.defs
+#
+# SPDX-License-Identifier: Apache-2.0
+#
+# ST77916 LCD driver — compiled into libdrivers.a (kernel side).
+# Collected by the parent platform Make.defs; compilation happens in
+# nuttx/drivers/, so VPATH/DEPPATH are relative to the `platform/` link.
+############################################################################
+
+ifeq ($(CONFIG_LCD_ST77916),y)
+CSRCS += st77916.c
+
+DEPPATH += --dep-path platform$(DELIM)drivers$(DELIM)st77916
+VPATH += :platform$(DELIM)drivers$(DELIM)st77916
+endif
