@@ -10,10 +10,12 @@ on:
   workflow_dispatch:
 
 env:
-  # manifest 仓库：push 用自身仓库；PR 事件使用 head 仓库（fork PR 时指向 fork 仓库）
-  MANIFEST_REPO: ${{ github.event_name == 'pull_request' && format('{0}/{1}', github.server_url, github.event.pull_request.head.repo.full_name) || format('{0}/{1}', github.server_url, github.repository) }}
-  # PR 事件中 github.ref_name 是 "1/merge"，需取 head.ref 获取真实分支名
-  MANIFEST_BRANCH: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.ref || github.ref_name }}
+  # manifest 仓库：push / workflow_dispatch 用自身仓库；PR 事件使用目标仓库（base）。
+  # 注意：merged 的 merge_commit_sha 只存在于目标(base)仓库，fork 仓库中无此 commit。
+  MANIFEST_REPO: ${{ format('{0}/{1}', github.server_url, github.repository) }}
+  # 目标 commit（sha）：PR 下用 GitHub 生成的 merge commit（合并后的结果，即 refs/pull/<num>/merge）；
+  # push / workflow_dispatch 用当前 commit。锁定 sha 可消除分支解析竞态与 fork 歧义。
+  MANIFEST_COMMIT: ${{ github.event_name == 'pull_request' && github.event.pull_request.merge_commit_sha || github.sha }}
   # 仓库名即 manifest 文件名
   REPO_NAME: ${{ github.event.repository.name }}
   MANIFEST_FILE: ${{ github.event.repository.name }}.xml
@@ -30,6 +32,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ env.MANIFEST_COMMIT }}
 
       - name: Scan configs
         id: matrix
@@ -81,17 +85,17 @@ jobs:
           cd ${{ env.OPENVELA_DIR }}
           repo init \
             -u "${{ env.MANIFEST_REPO }}" \
-            -b "${{ env.MANIFEST_BRANCH }}" \
+            -b "${{ env.MANIFEST_COMMIT }}" \
             -m "${{ env.MANIFEST_FILE }}" \
             --depth=1
           repo sync -c -j4
 
-      # Checkout 到 PR 分支（repo sync 拉下的是默认分支）
-      - name: Checkout contest repo to PR branch
+      # 签出到目标 commit（repo sync 拉下的是 manifest 默认 revision）
+      - name: Checkout contest repo to target commit
         run: |
           cd ${{ env.OPENVELA_DIR }}/${{ env.REPO_NAME }}
           git remote add ci "${{ env.MANIFEST_REPO }}" || true
-          git fetch ci ${{ env.MANIFEST_BRANCH }}
+          git fetch ci ${{ env.MANIFEST_COMMIT }}
           git checkout FETCH_HEAD
 
       # CMake 构建
