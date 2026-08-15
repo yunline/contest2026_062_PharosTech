@@ -4,14 +4,37 @@
 #
 
 config LCD_ST77916
-    bool "ST77916 QSPI LCD driver"
+    bool "ST77916-family QSPI LCD driver"
     default n
     ---help---
-        Enable the ST77916 LCD driver.
+        Enable the QSPI LCD driver shared by the ST77916 and GC9B72
+        controllers.  Both ICs use the same DCS command set
+        (0x2A/0x2B/0x2C/0x36/0x3A) and QSPI (MIPI DBI Type C) transfer
+        protocol; only the
+        initialization sequence and a few register details differ.
+
         The driver is compatible with any NuttX QSPI lower-half driver; the
         board init code obtains the QSPI handle and passes it in.
 
 if LCD_ST77916
+
+choice
+    prompt "Controller chip"
+    default LCD_ST77916_CHIP_TYPE_ST77916
+
+config LCD_ST77916_CHIP_TYPE_ST77916
+    bool "ST77916"
+    ---help---
+        Use the ST77916 controller.  This is the default.
+
+config LCD_ST77916_CHIP_TYPE_GC9B72
+    bool "GC9B72"
+    ---help---
+        Use the GC9B72 controller.  Shares the same DCS command set and
+        QSPI (MIPI DBI Type C) protocol as ST77916; only the
+        initialization sequence and a few register details differ.
+
+endchoice
 
 config LCD_ST77916_SWAP_RGB565
     bool "Byte-swap RGB565 pixel data before sending to the panel"

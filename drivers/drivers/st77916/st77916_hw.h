@@ -20,13 +20,17 @@
  ****************************************************************************/
 
 /****************************************************************************
- * ST77916 LCD controller hardware register definitions.
+ * ST77916/GC9B72 LCD controller hardware register definitions.
  *
- * This header collects the raw ST77916 controller hardware definitions:
- * command bytes, MADCTL/COLMOD register bit fields, GRAM geometry and the
- * QSPI opcodes used to transport commands to the panel.  These are panel
- * hardware details and are kept separate from the driver implementation
- * (st77916.c) and the public driver interface (st77916.h).
+ * This header collects the raw controller hardware definitions for the
+ * two supported chips (ST77916 and GC9B72): command bytes, MADCTL/COLMOD
+ * register bit fields, GRAM geometry and the QSPI opcodes used to
+ * transport commands to the panel.  The active chip is selected at build
+ * time via CONFIG_LCD_ST77916_CHIP_TYPE_*: only the initialization
+ * sequence and a few per-chip values (GRAM size, QSPI opcodes) differ;
+ * everything else is shared.  These are panel hardware details and are
+ * kept separate from the driver implementation (st77916.c) and the public
+ * driver interface (st77916.h).
  *
  ****************************************************************************/
 
@@ -40,6 +44,12 @@
 /****************************************************************************
  * Pre-processor Definitions
  ****************************************************************************/
+
+#if !defined(CONFIG_LCD_ST77916_CHIP_TYPE_ST77916) && \
+    !defined(CONFIG_LCD_ST77916_CHIP_TYPE_GC9B72)
+#warning "Controller chip is not defined, falling back to st77916"
+#define CONFIG_LCD_ST77916_CHIP_TYPE_ST77916 1
+#endif
 
 /* Command definitions */
 
@@ -70,14 +80,8 @@
 #define ST77916_CMD_MADCTL_BGR (1 << 3) /* swap RGB to BGR */
 
 /* COLMOD bit definitions */
-#define ST77916_CMD_COLMOD_IFPF_SHIFT 0 /* Control interface color format */
-#define ST77916_CMD_COLMOD_IFPF_MASK  (0x7 << ST77916_CMD_COLMOD_IFPF_SHIFT)
-#define ST77916_CMD_COLMOD_IFPF_16BIT (0x5 << ST77916_CMD_COLMOD_IFPF_SHIFT)
-#define ST77916_CMD_COLMOD_IFPF_18BIT (0x6 << ST77916_CMD_COLMOD_IFPF_SHIFT)
-#define ST77916_CMD_COLMOD_VIPF_SHIFT 4 /* RGB interface color format */
-#define ST77916_CMD_COLMOD_VIPF_MASK  (0x7 << ST77916_CMD_COLMOD_VIPF_SHIFT)
-#define ST77916_CMD_COLMOD_VIPF_16BIT (0x5 << ST77916_CMD_COLMOD_VIPF_SHIFT)
-#define ST77916_CMD_COLMOD_VIPF_18BIT (0x6 << ST77916_CMD_COLMOD_VIPF_SHIFT)
+#define ST77916_CMD_COLMOD_16BIT 0x65
+#define ST77916_CMD_COLMOD_18BIT 0x66
 
 /* Sleep-out settle delay in microseconds.  After SLPOUT the panel needs
  * this long before DISPON is valid.  The driver issues SLPOUT once at
@@ -98,21 +102,26 @@
  * (xoffset, yoffset); it must fit entirely within the GRAM.
  */
 
+#ifdef CONFIG_LCD_ST77916_CHIP_TYPE_ST77916
 #define ST77916_GRAM_WIDTH  360
 #define ST77916_GRAM_HEIGHT 390
+#elif defined(CONFIG_LCD_ST77916_CHIP_TYPE_GC9B72)
+#define ST77916_GRAM_WIDTH  360
+#define ST77916_GRAM_HEIGHT 360
+#endif /* CONFIG_LCD_ST77916_CHIP_TYPE_ST77916 */
 
-/* QSPI opcodes used to transport ST77916 LCD commands.  The LCD command
- * byte is carried in the middle byte of a 24-bit address (0x00XX00); the
- * opcode selects the line width of the address/data phases.  Naming is
- * <opcode phase 1>-<address phase 2>-<data phase 3> lines, the opcode
- * itself is always sent single-line:
+/* QSPI opcodes used to transport LCD commands and pixel data.  The LCD
+ * command byte is carried in the middle byte of a 24-bit address
+ * (0x00XX00); the opcode selects the line width of the address/data
+ * phases.  Naming is <opcode phase 1>-<address phase 2>-<data phase 3>
+ * lines, the opcode itself is always sent single-line.
  *
- *   0x02 - write, 1-1-1 (address 1-line, data 1-line)
- *   0xA2 - write, 1-1-2 (address 1-line, data 2-line)
- *   0x32 - write, 1-1-4 (address 1-line, data 4-line)
- *   0x38 - write, 1-4-4 (address 4-line, data 4-line)
- *   0x0B - read,  1-1-1 (address 1-line, data 1-line)
+ * The opcode values are per-chip (selected below with
+ * CONFIG_LCD_ST77916_CHIP_TYPE_*): ST77916 and GC9B72 use different
+ * numbers for the quad phases, so do not hard-code them in the driver.
  */
+
+#ifdef CONFIG_LCD_ST77916_CHIP_TYPE_ST77916
 
 #define ST77916_QSPI_CMD_WRITE_1_1_1 0x02
 #define ST77916_QSPI_CMD_WRITE_1_1_2 0xA2
@@ -120,6 +129,17 @@
 #define ST77916_QSPI_CMD_WRITE_1_4_4 0x38
 #define ST77916_QSPI_CMD_READ_1_1_1  0x0B
 #define ST77916_QSPI_ADDRLEN         3
+
+#elif defined(CONFIG_LCD_ST77916_CHIP_TYPE_GC9B72)
+
+#define ST77916_QSPI_CMD_WRITE_1_1_1 0x02
+/* GC9B72 does not support the 1-1-2 write mode */
+#define ST77916_QSPI_CMD_WRITE_1_1_4 0x32
+#define ST77916_QSPI_CMD_WRITE_1_4_4 0x12
+#define ST77916_QSPI_CMD_READ_1_1_1  0x03
+#define ST77916_QSPI_ADDRLEN         3
+
+#endif
 
 typedef struct
 {
@@ -132,6 +152,8 @@ typedef struct
     .data = (uint8_t[]){ __VA_ARGS__ },                         \
     .len = sizeof((uint8_t[]){ __VA_ARGS__ }) / sizeof(uint8_t) \
   }
+
+#ifdef CONFIG_LCD_ST77916_CHIP_TYPE_ST77916
 
 static const st77916_init_seq_entry_t g_st77916_init_seq[] = {
   _ST77916_INIT_SEQ(0xF0, 0x28),
@@ -328,6 +350,93 @@ static const st77916_init_seq_entry_t g_st77916_init_seq[] = {
   _ST77916_INIT_SEQ(0xF3, 0x01),
   _ST77916_INIT_SEQ(0xF0, 0x00)
 };
+
+#elif defined(CONFIG_LCD_ST77916_CHIP_TYPE_GC9B72)
+
+static const st77916_init_seq_entry_t g_st77916_init_seq[] = {
+  _ST77916_INIT_SEQ(0xFE),
+  _ST77916_INIT_SEQ(0xEF),
+
+  _ST77916_INIT_SEQ(0x80, 0x19),
+  _ST77916_INIT_SEQ(0x82, 0x09),
+  _ST77916_INIT_SEQ(0x83, 0x03),
+  _ST77916_INIT_SEQ(0x88, 0x00),
+  _ST77916_INIT_SEQ(0x89, 0x38),
+  _ST77916_INIT_SEQ(0x8A, 0x40),
+  _ST77916_INIT_SEQ(0x8B, 0x0A),
+  _ST77916_INIT_SEQ(0x8C, 0x00),
+
+  _ST77916_INIT_SEQ(0x81, 0xFF),
+  _ST77916_INIT_SEQ(0x84, 0xFF),
+  _ST77916_INIT_SEQ(0x85, 0xFF),
+  _ST77916_INIT_SEQ(0x86, 0xFF),
+  _ST77916_INIT_SEQ(0x87, 0xFF),
+  _ST77916_INIT_SEQ(0x8E, 0xFF),
+  _ST77916_INIT_SEQ(0x8F, 0xFF),
+
+  _ST77916_INIT_SEQ(0x98, 0x3E),
+  _ST77916_INIT_SEQ(0x99, 0x3E),
+
+  _ST77916_INIT_SEQ(0x7D, 0x72),
+
+  _ST77916_INIT_SEQ(0x70, 0x02, 0x03, 0x03, 0x06, 0x03, 0x03, 0x09, 0x07, 0x09,
+                    0x03),
+
+  _ST77916_INIT_SEQ(0x90, 0x06, 0x06, 0x01, 0x01),
+  _ST77916_INIT_SEQ(0x93, 0x02, 0xFF, 0x00),
+  _ST77916_INIT_SEQ(0xCB, 0x02),
+
+  _ST77916_INIT_SEQ(0xFB, 0x00, 0x00),
+  _ST77916_INIT_SEQ(0xF6, 0xC0),
+
+  _ST77916_INIT_SEQ(0x6C, 0x00, 0x00, 0x22, 0x00, 0xCC, 0x04, 0x58),
+  _ST77916_INIT_SEQ(0xAA, 0x0B, 0x00),
+  _ST77916_INIT_SEQ(0xEC, 0x07),
+
+  _ST77916_INIT_SEQ(0xF9, 0x40),
+
+  _ST77916_INIT_SEQ(0xEB, 0x01, 0x67),
+
+  _ST77916_INIT_SEQ(0x74, 0x01, 0x60, 0x00, 0x00, 0x00, 0x00),
+
+  _ST77916_INIT_SEQ(0xB5, 0x14, 0x14, 0x14),
+
+  _ST77916_INIT_SEQ(0x6E, 0x0B, 0x0B, 0x09, 0x09, 0x13, 0x13, 0x11, 0x11, 0x16,
+                    0x15, 0x01, 0x04, 0x00, 0x0D, 0x1D, 0x00, 0x00, 0x1D, 0x0D,
+                    0x00, 0x04, 0x08, 0x15, 0x16, 0x12, 0x12, 0x14, 0x14, 0x0A,
+                    0x0A, 0x0C, 0x0C),
+
+  _ST77916_INIT_SEQ(0x60, 0x38, 0x1C, 0x13, 0x56),
+  _ST77916_INIT_SEQ(0x61, 0xF8, 0x0A, 0x13, 0x56),
+  _ST77916_INIT_SEQ(0x62, 0xF8, 0x0B, 0x13, 0x56),
+  _ST77916_INIT_SEQ(0x63, 0x38, 0x1C, 0x13, 0x56),
+
+  _ST77916_INIT_SEQ(0x64, 0x38, 0x20, 0x72, 0xF8, 0x13, 0x56),
+  _ST77916_INIT_SEQ(0x65, 0x78, 0x1A, 0x70, 0x0B, 0x56, 0x13),
+  _ST77916_INIT_SEQ(0x66, 0x38, 0x24, 0x72, 0xFC, 0x13, 0x56),
+
+  _ST77916_INIT_SEQ(0x68, 0xB3, 0x08, 0x0E, 0x08, 0x0E, 0x0A, 0x0A),
+  _ST77916_INIT_SEQ(0x69, 0xB3, 0x08, 0x0E, 0x08, 0x0E, 0x0A, 0x0A),
+  _ST77916_INIT_SEQ(0x6A, 0x00, 0x00),
+
+  _ST77916_INIT_SEQ(0x7C, 0xB6, 0x29),
+
+  _ST77916_INIT_SEQ(0xAC, 0x40),
+
+  _ST77916_INIT_SEQ(0xC3, 0x1A),
+  _ST77916_INIT_SEQ(0xC4, 0x24),
+  _ST77916_INIT_SEQ(0xC9, 0x2F),
+
+  _ST77916_INIT_SEQ(0xF0, 0x11, 0x17, 0x08, 0x06, 0x05, 0x38),
+  _ST77916_INIT_SEQ(0xF1, 0x4D, 0x72, 0x72, 0x2D, 0x34, 0x8F),
+  _ST77916_INIT_SEQ(0xF2, 0x11, 0x17, 0x08, 0x06, 0x05, 0x38),
+  _ST77916_INIT_SEQ(0xF3, 0x4D, 0x72, 0x72, 0x2D, 0x34, 0x8F),
+
+  _ST77916_INIT_SEQ(0xFE),
+  _ST77916_INIT_SEQ(0xEE)
+};
+
+#endif /* CONFIG_LCD_ST77916_CHIP_TYPE_ST77916 */
 
 #undef _ST77916_INIT_SEQ
 

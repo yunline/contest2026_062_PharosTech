@@ -20,7 +20,13 @@
  ****************************************************************************/
 
 /****************************************************************************
- * ST77916 QSPI LCD lower-half driver.
+ * ST77916/GC9B72 QSPI LCD lower-half driver.
+ *
+ * The two controllers share the same MIPI DCS command set, transmitted
+ * over a MIPI DBI (Type C) QSPI bus; the active chip is selected at
+ * build time via
+ * CONFIG_LCD_ST77916_CHIP_TYPE_* and only changes the initialization
+ * sequence and a few hardware details in st77916_hw.h.
  *
  * This file implements the NuttX LCD lower-half protocol described in
  * <nuttx/lcd/lcd.h>.  The driver does not own the QSPI lower-half device:
@@ -317,7 +323,7 @@ static void *st77916_rev16_cpy(void *dst, const void *src, size_t n)
  *
  * Description:
  *   Return the number of bits per pixel for the given framebuffer pixel
- *   format.  The ST77916 supports only RGB565 (16-bit, FB_FMT_RGB16_565)
+ *   format.  The driver supports only RGB565 (16-bit, FB_FMT_RGB16_565)
  *   and RGB666 (24-bit, FB_FMT_RGB24); any other format returns 0 and is
  *   rejected by st77916_lcdinitialize().
  *
@@ -577,10 +583,10 @@ static int st77916_putarea(struct lcd_dev_s *dev, fb_coord_t row_start,
     }
 
   /* Data payload: the staged tightly-packed pixels of the whole area.
-   * The QSPI memory opcode 0x32 (1-1-4) sends the address single-line
-   * and the data on four lines; the opcode itself stays single-line
-   * because QSPIMEM_QUADIO does not affect the CMDB phase in the FSPI
-   * driver.
+   * The QSPI memory opcode (ST77916_QSPI_CMD_WRITE_1_4_4, selected per
+   * chip in st77916_hw.h) sends the address single-line and the data on
+   * four lines; the opcode itself stays single-line because
+   * QSPIMEM_QUADIO does not affect the CMDB phase in the FSPI driver.
    */
 
   memset(&meminfo, 0, sizeof(meminfo));
@@ -916,7 +922,7 @@ xfer_err:
  * Input Parameters:
  *   qspi   - NuttX QSPI lower-half device obtained by board code
  *            (e.g. rk3576_fspi_initialize(1, 0)).
- *   fmt    - Framebuffer pixel format.  The ST77916 supports only
+ *   fmt    - Framebuffer pixel format.  The driver supports only
  *            FB_FMT_RGB16_565 (16-bit RGB565) and FB_FMT_RGB24 (24-bit
  *            RGB666); any other format is rejected.
  *   xres   - Framebuffer width in pixel columns.  This is the logical
@@ -969,11 +975,11 @@ struct lcd_dev_s *st77916_lcdinitialize(
       return NULL;
     }
 
-  /* The ST77916 supports only RGB565 (16-bit) and RGB666 (24-bit). */
+  /* The driver supports only RGB565 (16-bit) and RGB666 (24-bit). */
 
   if (fmt != FB_FMT_RGB16_565 && fmt != FB_FMT_RGB24)
     {
-      lcderr("ERROR: unsupported pixel format 0x%02x (ST77916 supports "
+      lcderr("ERROR: unsupported pixel format 0x%02x (driver supports "
              "FB_FMT_RGB16_565 and FB_FMT_RGB24 only)\n",
              fmt);
       return NULL;
@@ -1133,12 +1139,15 @@ struct lcd_dev_s *st77916_lcdinitialize(
   _CHECK_XFER_ERR(ret);
 
   ret = ST77916_COMMAND(priv, ST77916_CMD_COLMOD,
-                        fmt == FB_FMT_RGB24 ? ST77916_CMD_COLMOD_IFPF_18BIT
-                                            : ST77916_CMD_COLMOD_IFPF_16BIT);
+                        fmt == FB_FMT_RGB24 ? ST77916_CMD_COLMOD_18BIT
+                                            : ST77916_CMD_COLMOD_16BIT);
   _CHECK_XFER_ERR(ret);
 
-  ret = ST77916_COMMAND_NOARG(priv, ST77916_CMD_INVON);
-  _CHECK_XFER_ERR(ret);
+  if (invert)
+    {
+      ret = ST77916_COMMAND_NOARG(priv, ST77916_CMD_INVON);
+      _CHECK_XFER_ERR(ret);
+    }
 
   /* Tearing Effect (TE) configuration
    * When enabled, turn on the TE output pin in the mode requested by the
