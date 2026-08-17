@@ -18,5 +18,6 @@
     <linkfile src="chips" dest="vendor/rockchip/chips"/>
     <linkfile src="app/k7flash" dest="apps/examples/k7flash"/>
     <linkfile src="app/audioctl" dest="apps/system/audioctl"/>
+    <linkfile src="app/nyabula_display" dest="apps/graphics/nyabula_display"/>
   </project>
 </manifest>

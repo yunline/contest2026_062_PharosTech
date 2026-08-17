@@ -1,0 +1,54 @@
+#
+# For a description of the syntax of this configuration file,
+# see the file kconfig-language.txt in the NuttX tools repository.
+#
+
+menuconfig GRAPHICS_NYABULA_DISPLAY
+	tristate "Nyabula Display LVGL Compatibility Layer"
+	default n
+	depends on GRAPHICS_LVGL
+	---help---
+		Enable the Nyabula Display LVGL compatibility layer for NuttX.
+		This provides LCD and touchscreen drivers for LVGL applications.
+
+if GRAPHICS_NYABULA_DISPLAY
+
+config NYABULA_DISPLAY_PRIORITY
+	int "nyabula_display task priority"
+	default 100
+
+config NYABULA_DISPLAY_STACKSIZE
+	int "nyabula_display stack size"
+	default 32768
+
+config NYABULA_DISPLAY_BUFFER_SIZE
+	int "LCD buffer size in bytes"
+	default 1048576
+	---help---
+		Size of the LCD draw buffer in bytes. Default is 1MB.
+
+config NYABULA_DISPLAY_LCD_DEVPATH0
+	string "First LCD device path"
+	default "/dev/lcd0"
+	---help---
+		The path to the first LCD device.
+
+config NYABULA_DISPLAY_LCD_DEVPATH1
+	string "Second LCD device path"
+	default "/dev/lcd1"
+	---help---
+		The path to the second LCD device.
+
+config NYABULA_DISPLAY_SCREEN_WIDTH
+	int "Screen width in pixels"
+	default 360
+	---help---
+		Width of each screen in pixels.
+
+config NYABULA_DISPLAY_SCREEN_HEIGHT
+	int "Screen height in pixels"
+	default 360
+	---help---
+		Height of each screen in pixels.
+
+endif # GRAPHICS_NYABULA_DISPLAY
