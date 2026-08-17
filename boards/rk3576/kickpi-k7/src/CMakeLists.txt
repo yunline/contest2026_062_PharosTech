@@ -21,6 +21,10 @@ if(CONFIG_KICKPI_K7_RTC)
   list(APPEND SRCS kickpi_k7_rtc.c)
 endif()
 
+if(CONFIG_KICKPI_K7_LCD)
+  list(APPEND SRCS kickpi_k7_lcd.c)
+endif()
+
 target_sources(board PRIVATE ${SRCS})
 
 if(CONFIG_ETC_ROMFS)

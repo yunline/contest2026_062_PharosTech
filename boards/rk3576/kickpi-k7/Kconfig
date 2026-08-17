@@ -132,4 +132,15 @@ config KICKPI_K7_RTC
 		clock on I2C2 as /dev/rtc0.  Muxes the I2C2 SCL (GPIO0_B7) and SDA
 		(GPIO0_C0) pins to alternate function 9 at boot.
 
+config KICKPI_K7_LCD
+	bool "ST77916 LCD panel over FSPI1 (hardware modification)"
+	default n
+	depends on RK3576_FSPI && LCD_ST77916 && LCD_DEV
+	---help---
+		Enable the ST77916 LCD panel connected via FSPI1 CS0 (QSPI).
+		This is not part of the stock kickpi-k7 board; it requires a
+		hardware modification where the FSPI1 pins (shared with the SD
+		card slot) are repurposed for the display.  The SD card must be
+		removed before using the panel.
+
 endif # ARCH_BOARD_KICKPI_K7
