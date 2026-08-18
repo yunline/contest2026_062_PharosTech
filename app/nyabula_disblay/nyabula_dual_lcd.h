@@ -30,6 +30,9 @@
 #include <pthread.h>
 #include <semaphore.h>
 
+/* Audit / profiling interface (NYABULA_AUDIT switch lives here). */
+#include "nyabula_display_audit.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -154,6 +157,9 @@ typedef struct
    * the same instant (a milder operating point for the scheduler). */
   uint8_t te_phase_shift;
 
+  /* Screen index (0 or 1), set at create time. */
+  int screen_id;
+
   bool initialized;
 } nyabula_screen_t;
 
@@ -168,8 +174,10 @@ typedef struct
   int gen;        /* Content generation */
 } nyabula_write_job_t;
 
-/* Dual screen context. */
-typedef struct
+/* Dual screen context.  The tag is exposed so the audit interface (in
+ * nyabula_display_audit.h) can forward-declare it without pulling in the
+ * full definition. */
+typedef struct nyabula_dual_lcd_s
 {
   nyabula_screen_t screen[NYABULA_DUAL_LCD_MAX_SCREENS];
 

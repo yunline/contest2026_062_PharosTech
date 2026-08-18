@@ -33,6 +33,7 @@ if(CONFIG_GRAPHICS_NYABULA_DISPLAY)
     main.c
     nyabula_display.c
     nyabula_dual_lcd.c
+    nyabula_display_audit.c
     nyabula_dual_demo.c)
 
   target_compile_definitions(

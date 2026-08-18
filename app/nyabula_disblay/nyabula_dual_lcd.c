@@ -81,8 +81,6 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <nuttx/lcd/lcd_dev.h>
-#include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <time.h>
@@ -351,8 +349,18 @@ static void te_edge_fall(nyabula_dual_lcd_t *dual, int sid)
 
   sem_wait(&scr->st_mutex);
 
-  /* 1) Lock the latest fully-rendered buffer into the half-push slot. */
-  if (scr->render_done_buf >= 0)
+  /* 1) Lock the latest fully-rendered buffer into the half-push slot, but
+   * only when the previously locked buffer is done -- i.e. its back half
+   * was submitted and the transfer thread released half_buf to -1.  If an
+   * old back half is still pending (deferred by v6 backpressure), do NOT
+   * overwrite half_buf: that would drop the old buffer's back-half
+   * reference and its fill_pending would never decrement, leaking that
+   * physical buffer forever and progressively locking this screen out.
+   * (v6's _half_gen is a generation number -- free to be overwritten,
+   * dropping only one frame's content -- whereas half_buf is a physical
+   * buffer index bound to the buffer's lifetime, so it must not be
+   * re-pointed while its back half is unwritten.) */
+  if (scr->half_buf < 0 && scr->render_done_buf >= 0)
     {
       scr->half_buf = scr->render_done_buf;
       scr->render_done_buf = -1;
@@ -473,6 +481,26 @@ static int job_dequeue_fair(nyabula_dual_lcd_t *dual, nyabula_write_job_t *out)
 }
 
 /****************************************************************************
+ * Name: te_ts_add_us
+ *
+ * Description:
+ *   Advance a timespec by `us` microseconds in place (normalizing ns).
+ *   Used by the absolute-time TE calibration to step the quarter-frame
+ *   target clock without accumulating drift.
+ *
+ ****************************************************************************/
+
+static void te_ts_add_us(struct timespec *ts, useconds_t us)
+{
+  ts->tv_nsec += (long)us * 1000L;
+  while (ts->tv_nsec >= 1000000000L)
+    {
+      ts->tv_nsec -= 1000000000L;
+      ts->tv_sec++;
+    }
+}
+
+/****************************************************************************
  * Name: te_thread_func
  *
  * Description:
@@ -499,12 +527,22 @@ static void *te_thread_func(void *arg)
   nyabula_dual_lcd_t *dual = (nyabula_dual_lcd_t *)arg;
   useconds_t period_us;
   useconds_t quarter_us;
+  struct timespec next_ts;
   uint8_t tick;
   int sid;
 
   period_us = 1000000 / NYABULA_DUAL_LCD_REFRESH_HZ;
   quarter_us = period_us / 4;
   tick = 0;
+
+  /* Initialize the absolute quarter-frame target clock, one quarter ahead so
+   * the first TE edge fires ~quarter_us into the run.  From here on we sleep
+   * to ABSOLUTE target times (TIMER_ABSTIME), accumulating the step onto a
+   * fixed baseline each quarter.  usleep()'s unpredictable per-sleep overhead
+   * then shows up only as a non-cumulative per-quarter residual instead of
+   * 4x amplified into the frame period. */
+  clock_gettime(CLOCK_MONOTONIC, &next_ts);
+  te_ts_add_us(&next_ts, quarter_us);
 
   while (dual->running)
     {
@@ -526,8 +564,39 @@ static void *te_thread_func(void *arg)
             }
         }
 
-      usleep(quarter_us);
+      /* Sleep to the CURRENT absolute target, then advance the target by one
+       * quarter onto the IDEAL clock line -- do NOT re-anchor to the actual
+       * wake-up moment.  If we re-anchored on the real wake time, every
+       * late-wake delta (scheduling delay, higher-prio interrupt, other load)
+       * would be baked into the next period permanently, and the long-run
+       * frame period would settle at (quarter + ~1ms) instead of period_us
+       * (measured: target 50Hz landed at 41.67Hz / 24ms).  Keeping the
+       * absolute target accumulating on the ideal line means a late wake
+       * shortens only the NEXT sleep (it is caught up), so single-frame
+       * jitter does not accumulate and the long-run period stays exactly
+       * period_us.
+       *
+       * quarter_us = period_us/4 truncates (60Hz -> 16666/4 = 4166us, i.e.
+       * 4*4166 = 16664 != 16666).  To hold the full frame at exactly
+       * period_us we add the truncation remainder (period_us - 3*quarter_us)
+       * on the final quarter (tick==3) and quarter_us on the other three, so
+       * one frame = (p-3q) + q + q + q = p (0 truncation drift). */
+      clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next_ts, NULL);
+
+      if (tick == 3)
+        {
+          /* Closing the frame: use the exact per-frame remainder so the
+           * four quarters sum to period_us (0 truncation drift). */
+          te_ts_add_us(&next_ts, period_us - 3 * quarter_us);
+        }
+      else
+        {
+          te_ts_add_us(&next_ts, quarter_us);
+        }
+
       tick = (uint8_t)((tick + 1) & 3u);
+
+      nyabula_disp_audit_te_frame(dual, tick);
     }
 
   return NULL;
@@ -562,12 +631,13 @@ void nyabula_dual_lcd_task(nyabula_dual_lcd_t *dual)
 {
   struct timespec ts;
   uint32_t idle;
-  int sid;
 
   if (!dual)
     {
       return;
     }
+
+  nyabula_disp_audit_loop(dual);
 
   /* Run one cycle of the LVGL state machine (timers, animation).  This
    * advances animations (time from the NuttX clock via lv_tick_set_cb) and
@@ -583,31 +653,107 @@ void nyabula_dual_lcd_task(nyabula_dual_lcd_t *dual)
    * and, crucially, skips drawing when there is no invalid area -- so a
    * static screen is not force-redrawn each frame (saves CPU and QSPI
    * bandwidth), while a running animation is rendered exactly once per TE
-   * period with the freshest accumulated content. */
-  for (sid = 0; sid < NYABULA_DUAL_LCD_MAX_SCREENS; sid++)
-    {
-      nyabula_screen_t *scr = &dual->screen[sid];
-      bool req = false;
+   * period with the freshest accumulated content.
+   *
+   * The two screens share this single render thread, so a screen whose
+   * double-buffer is full must NOT stall the loop here (v6 "defer not drop",
+   * see Simulation._db_pending).  We render in two passes:
+   *   Pass 1 - render every screen that has a free buffer (fill_pending < 2)
+   *            right away; defer any screen whose buffers are both full.
+   *   Pass 2 - after the other screen(s) have rendered, wait (CPU-free) for
+   *            a free buffer on each deferred screen and render it.  This
+   *            guarantees a full double-buffer on one screen no longer
+   *            serializes (and starves) the other screen's render. */
+  {
+    bool armed[NYABULA_DUAL_LCD_MAX_SCREENS];
+    bool deferred[NYABULA_DUAL_LCD_MAX_SCREENS];
+    int sid;
 
-      if (!scr->initialized || !scr->disp)
-        {
-          continue;
-        }
+    /* Collect the armed render requests (consume the bools once). */
+    for (sid = 0; sid < NYABULA_DUAL_LCD_MAX_SCREENS; sid++)
+      {
+        nyabula_screen_t *scr = &dual->screen[sid];
 
-      sem_wait(&scr->st_mutex);
-      if (scr->render_request)
-        {
-          scr->render_request = false;
-          req = true;
-        }
+        armed[sid] = false;
+        deferred[sid] = false;
 
-      sem_post(&scr->st_mutex);
+        if (!scr->initialized || !scr->disp)
+          {
+            continue;
+          }
 
-      if (req)
-        {
-          lv_refr_now(scr->disp);
-        }
-    }
+        sem_wait(&scr->st_mutex);
+        if (scr->render_request)
+          {
+            scr->render_request = false;
+            armed[sid] = true;
+          }
+
+        sem_post(&scr->st_mutex);
+      }
+
+    /* Pass 1: render screens with a free buffer; defer the rest. */
+    for (sid = 0; sid < NYABULA_DUAL_LCD_MAX_SCREENS; sid++)
+      {
+        nyabula_screen_t *scr = &dual->screen[sid];
+        bool room;
+
+        if (!armed[sid])
+          {
+            continue;
+          }
+
+        sem_wait(&scr->st_mutex);
+        room = (scr->fill_pending < NYABULA_DUAL_LCD_MAX_SCREENS);
+        sem_post(&scr->st_mutex);
+
+        if (room)
+          {
+            nyabula_disp_audit_render_start(sid);
+            lv_refr_now(scr->disp);
+            nyabula_disp_audit_render_end(sid);
+          }
+        else
+          {
+            /* Both buffers hold rendered-but-unwritten generations: defer to
+             * pass 2 so the other screen can render meanwhile. */
+            deferred[sid] = true;
+          }
+      }
+
+    /* Pass 2: render the deferred screens once a buffer frees.  By here the
+     * other screen(s) have already rendered, so this wait is screen-local
+     * and signalled (no busy CPU, no cross-screen serialization). */
+    for (sid = 0; sid < NYABULA_DUAL_LCD_MAX_SCREENS; sid++)
+      {
+        nyabula_screen_t *scr = &dual->screen[sid];
+
+        if (!deferred[sid])
+          {
+            continue;
+          }
+
+        nyabula_disp_audit_defer_wait_start(sid);
+        sem_wait(&scr->st_mutex);
+        while (scr->fill_pending >= NYABULA_DUAL_LCD_MAX_SCREENS &&
+               scr->initialized)
+          {
+            /* Wait (signalled) for the transfer thread to finish a back-half
+             * write and release a buffer.  This never blocks the render of
+             * the sibling screen, which already happened in pass 1. */
+            sem_post(&scr->st_mutex);
+            sem_wait(&scr->buf_free);
+            sem_wait(&scr->st_mutex);
+          }
+
+        sem_post(&scr->st_mutex);
+        nyabula_disp_audit_defer_wait_end(sid);
+
+        nyabula_disp_audit_render_start(sid);
+        lv_refr_now(scr->disp);
+        nyabula_disp_audit_render_end(sid);
+      }
+  }
 
   /* Wait for either a TE edge kick (posted by the TE thread so we service
    * lv_timer_handler() promptly at the frame boundary) or until the LVGL
@@ -628,7 +774,9 @@ void nyabula_dual_lcd_task(nyabula_dual_lcd_t *dual)
       ts.tv_nsec %= 1000000000L;
     }
 
+  nyabula_disp_audit_waitkick_start(dual);
   sem_timedwait(&dual->render_kick, &ts);
+  nyabula_disp_audit_waitkick_end(dual);
 }
 
 /****************************************************************************
@@ -676,6 +824,9 @@ static void *transfer_thread_func(void *arg)
       lcd_area.data =
           scr->buf[job.buf_idx].data + (int64_t)job.start_line * scr->stride;
 
+      /* Measure transfer wall time + front-half refresh period. */
+      nyabula_disp_audit_transfer_start(job.screen_id, job.start_line);
+
       ret = ioctl(scr->fd, LCDDEVIO_PUTAREA, (unsigned long)&lcd_area);
       if (ret < 0)
         {
@@ -683,6 +834,8 @@ static void *transfer_thread_func(void *arg)
           lcdinfo("screen %d PUTAREA rows %u-%u failed: %d\n", job.screen_id,
                   lcd_area.row_start, lcd_area.row_end, -ret);
         }
+
+      nyabula_disp_audit_transfer_end(job.screen_id);
 
       /* Lines physically written to the panel for this screen. */
       sem_wait(&scr->st_mutex);
@@ -746,6 +899,8 @@ static void flush_wait_cb(lv_display_t *disp)
       return;
     }
 
+  nyabula_disp_audit_flush_wait_start(scr->screen_id);
+
   sem_wait(&scr->st_mutex);
   while (scr->fill_pending >= NYABULA_DUAL_LCD_MAX_SCREENS && scr->initialized)
     {
@@ -759,6 +914,8 @@ static void flush_wait_cb(lv_display_t *disp)
     }
 
   sem_post(&scr->st_mutex);
+
+  nyabula_disp_audit_flush_wait_end(scr->screen_id);
 }
 
 /****************************************************************************
@@ -785,6 +942,8 @@ static void flush_cb(lv_display_t *disp, const lv_area_t *area,
   (void)area; /* Full-refresh: LVGL flushes the whole screen each frame. */
 
   buf_idx = (color_p == scr->buf[0].data) ? 0 : 1;
+
+  nyabula_disp_audit_flush_end(scr->screen_id);
 
   sem_wait(&scr->st_mutex);
 
@@ -924,11 +1083,12 @@ static int screen_display_on(nyabula_screen_t *scr)
  *
  ****************************************************************************/
 
-static int screen_init(nyabula_screen_t *scr, const char *dev_path, int width,
-                       int height)
+static int screen_init(nyabula_screen_t *scr, int sid, const char *dev_path,
+                       int width, int height)
 {
   int ret;
 
+  scr->screen_id = sid;
   scr->width = width;
   scr->height = height;
   scr->stride = width * 2; /* RGB565: 2 bytes per pixel */
@@ -1165,8 +1325,10 @@ nyabula_dual_lcd_t *nyabula_dual_lcd_create(const char *dev_path0,
   sem_init(&dual->job_space, 0, NYABULA_JOB_QUEUE_SIZE);
   sem_init(&dual->render_kick, 0, 0);
 
+  nyabula_disp_audit_init();
+
   /* Initialize screen 0 */
-  ret = screen_init(&dual->screen[0], dev_path0, width, height);
+  ret = screen_init(&dual->screen[0], 0, dev_path0, width, height);
   if (ret < 0)
     {
       LV_LOG_ERROR("Failed to initialize screen 0");
@@ -1174,7 +1336,7 @@ nyabula_dual_lcd_t *nyabula_dual_lcd_create(const char *dev_path0,
     }
 
   /* Initialize screen 1 */
-  ret = screen_init(&dual->screen[1], dev_path1, width, height);
+  ret = screen_init(&dual->screen[1], 1, dev_path1, width, height);
   if (ret < 0)
     {
       LV_LOG_ERROR("Failed to initialize screen 1");

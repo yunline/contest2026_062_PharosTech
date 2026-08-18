@@ -51,4 +51,16 @@ config NYABULA_DISPLAY_SCREEN_HEIGHT
 	---help---
 		Height of each screen in pixels.
 
+config NYABULA_DISPLAY_AUDIT
+	bool "Enable dual-screen audit / profiling instrumentation"
+	default n
+	---help---
+		Per-screen runtime metrics (render time, transfer time, transfer
+		FPS) printed periodically by the TE thread.  The metrics are
+		collected because the dual-screen compat layer bypasses LVGL's
+		built-in sysmon.
+
+		When disabled, all instrumentation (and its storage/overhead) is
+		stripped from the build.
+
 endif # GRAPHICS_NYABULA_DISPLAY

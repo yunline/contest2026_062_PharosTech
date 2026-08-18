@@ -55,11 +55,21 @@ static nyabula_dual_lcd_t *g_dual_lcd = NULL;
  *   lv_tick_inc() feeder is required, and time never drifts when wake-ups
  *   are skipped.
  *
+ *   Does NOT use clock_systime_ticks()*MSEC_PER_TICK: MSEC_PER_TICK is
+ *   integer-truncated (when CONFIG_USEC_PER_TICK < 1000 it collapses to 0,
+ *   freezing the LVGL clock), so we derive true milliseconds from the
+ *   monotonic timespec (sub-tick resolution under tickless), which is
+ *   independent of the configured tick period.
+ *
  ****************************************************************************/
 
 static uint32_t nyabula_tick_get_ms(void)
 {
-  return (uint32_t)(clock_systime_ticks() * MSEC_PER_TICK);
+  struct timespec ts;
+
+  clock_systime_timespec(&ts);
+  return (uint32_t)((uint64_t)ts.tv_sec * 1000ULL +
+                    (uint64_t)ts.tv_nsec / 1000000ULL);
 }
 
 /****************************************************************************

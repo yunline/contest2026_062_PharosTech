@@ -28,7 +28,7 @@ STACKSIZE = $(CONFIG_NYABULA_DISPLAY_STACKSIZE)
 MODULE = $(CONFIG_GRAPHICS_NYABULA_DISPLAY)
 
 MAINSRC = main.c
-CSRCS = nyabula_display.c nyabula_dual_lcd.c nyabula_dual_demo.c
+CSRCS = nyabula_display.c nyabula_dual_lcd.c nyabula_display_audit.c nyabula_dual_demo.c
 
 CFLAGS += -DCONFIG_NYABULA_DISPLAY_BUFFER_SIZE=$(CONFIG_NYABULA_DISPLAY_BUFFER_SIZE)
 
