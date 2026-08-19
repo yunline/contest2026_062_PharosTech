@@ -57,8 +57,8 @@
  ****************************************************************************/
 
 /* Run one independent, animated UI on each of the two screens to exercise
- * the dual-screen v6 scheduler (both screens animate and take turns sharing
- * the single QSPI write bus):
+ * the dual-screen v8 scheduler (both screens animate and contend for the
+ * single QSPI write bus):
  *   - Screen 0: a spinning fan blade + a horizontally bouncing ball
  *   - Screen 1: a counter-spinning fan blade + a vertically bouncing square
  *

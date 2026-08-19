@@ -1,8 +1,9 @@
 /****************************************************************************
  * apps/graphics/nyabula_display/nyabula_dual_lcd.c
  *
- * Dual-screen dual-buffer LVGL interface layered on the v6 "BoundedChase"
- * frame scheduler.
+ * Dual-screen dual-buffer LVGL interface layered on the v8 "BoundedChase"
+ * frame scheduler (an in-house dual-panel scheduling algorithm; its C port
+ * lives in nyabula_v8_scheduler.c).
  *
  * Licensed to the Apache Software Foundation (ASF) under one or more
  * contributor license agreements.  See the NOTICE file distributed with
@@ -25,50 +26,44 @@
  * Design overview
  *
  * Two panels (ST77916, 360x360 RGB565) share ONE QSPI write bus, so at any
- * instant only one screen can be written.  This layer connects LVGL to the
- * panels using a double-buffer pipeline and a faithful C port of the v6
- * "BoundedChase" scheduler (see vsyncalg/V6_DESIGN.md and
- * vsyncalg/algos/bounded_chase.py).
+ * instant only one screen can be written.  This layer is the FRAMEWORK:
+ * it owns the threads, the LVGL integration and the DMA (PUTAREA) device
+ * access, and passes all *scheduling decisions* to the v8 algorithm
+ * (nyabula_v8_scheduler.c).  Framework and algorithm are fully decoupled:
+ * the algorithm only consumes the six callbacks/requests declared in
+ * nyabula_v8_scheduler.h and knows nothing about LVGL or DMA.
  *
  * Thread model
- *   - Render loop    : hosted by the caller (main) via
- *nyabula_dual_lcd_task(), which runs lv_timer_handler() (LVGL is
- *single-threaded).
+ *   - Render loop    : logically a render thread, hosted by the caller
+ *                   (main) via nyabula_dual_lcd_task(), which runs
+ *                   lv_timer_handler() (LVGL is single-threaded).
  *   - TE thread       : software frame clock standing in for the real TE
  *                     signal.  Fires the scan edges at the frame rate and
  *                     feeds the ISR-safe edge handlers.  The two screens'
  *                     clocks are staggered 90-deg to de-correlate their QSPI
- *                     write bursts.
+ *                     write bursts.  High priority for correct timing;
+ *                     swap for a gpio ISR once hardware TE is wired.
  *   - Transfer thread: pops half-block write jobs and issues a BLOCKING
  *                     LCDDEVIO_PUTAREA ioctl (QSPI DMA).  It does not
  *                     consume CPU while the DMA is in flight.
  *
  * TE signal / state machine
  *   The panel TE is not yet wired in hardware, so a software frame clock
- *   synthesizes the two edges of the scan:
- *     * falling edge (scan has completed the front half 0..half-1):
- *          lock the latest fully-rendered buffer, submit the FRONT half
- *          (0..half) as one block, and kick off the next frame's render.
- *     * rising  edge (a full frame has been scanned):
- *          submit the BACK half (half..total) from the SAME locked buffer.
- *   Writing generation always comes from a buffer whose render has fully
- *   completed, and both halves come from the same buffer => tearing is
- *   avoided while bandwidth is sufficient.
+ *   synthesizes the two edges of the scan and forwards each to the v8
+ *   algorithm via nyabula_v8_on_scan_half() (falling edge, front half
+ *   scanned) and nyabula_v8_on_scan_start() (rising edge, full frame
+ *   scanned).  All "which half, which generation, when" decisions live in
+ *   the algorithm; the framework only executes the resulting write jobs on
+ *   the DMA thread and reports block completion back to the algorithm.
  *
- *   The edge entry points (nyabula_te_edge_rise/fall) are kept ISR-safe:
- *   they only update state and post semaphores.  When the real TE signal
- *   is routed (gpio_irqattach), the same functions can be called from an
- *   ISR with no change to the algorithm.
+ *   The edge entry points are kept ISR-safe: they only forward to v8 and
+ *   post semaphores.  When the real TE signal is routed (gpio_irqattach),
+ *   the same functions are called from an ISR with no change.
  *
- * Backpressure (the heart of v6)
- *   Each screen tracks submitted_lines - written_lines ("outstanding").
- *   When it reaches the half-frame budget, submission is deferred so the
- *   write queue cannot grow unboundedly => content degrades to
- *   alternate-frame refresh instead of freezing when the bus is saturated.
- *
- * Fair dispatch
- *   The transfer thread serves job[0] and job[1] round-robin so neither
- *   screen can monopolize the shared bus.
+ * Framework <-> algorithm interface (see nyabula_v8_scheduler.h):
+ *   framework -> algorithm : on_scan_start / on_scan_half / on_render_done /
+ *                            on_block_write_done
+ *   algorithm -> framework : request_render / request_write / on_gen_complete
  ****************************************************************************/
 
 /****************************************************************************
@@ -81,6 +76,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <nuttx/lcd/lcd_dev.h>
+#include <sched.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <time.h>
@@ -95,13 +91,21 @@
 static int32_t align_round_up(int32_t v, uint16_t align);
 static void rounder_cb(lv_event_t *e);
 
-/* v6 state machine (per screen) */
-static int engine_remaining(uint32_t submitted, uint32_t written);
-static bool engine_can_submit(const nyabula_screen_t *scr);
+/* Create a thread with an explicit FIFO priority (lower number = higher). */
+static int create_thread_prio(pthread_t *thr, void *(*fn)(void *), void *arg,
+                              int prio);
+
+/* TE edge forwarding to the v8 algorithm (ISR-safe). */
 static void te_edge_rise(nyabula_dual_lcd_t *dual, int sid);
 static void te_edge_fall(nyabula_dual_lcd_t *dual, int sid);
 
-/* Job queue */
+/* v8 request callbacks (algorithm -> framework). */
+static void v8_request_render(struct nyabula_screen *scr, int gen);
+static bool v8_request_write(struct nyabula_screen *scr, int start_line,
+                             int num_lines, int gen);
+static void v8_on_gen_complete(struct nyabula_screen *scr, int gen);
+
+/* Job queue (strict FIFO, bounded). */
 static int job_enqueue(nyabula_dual_lcd_t *dual, const nyabula_write_job_t *j);
 static int job_dequeue_fair(nyabula_dual_lcd_t *dual,
                             nyabula_write_job_t *out);
@@ -223,49 +227,139 @@ static void te_refr_req_cb(lv_event_t *e)
 }
 
 /****************************************************************************
- * v6 state machine helpers
+ * v8 request callbacks (algorithm -> framework)
  ****************************************************************************/
 
-/* Outline lines still "in flight" (submitted but not yet written) for a
- * screen.  Mirrors BoundedChaseScheduler._outstanding(). */
+/* Map a generation number to the physical offscreen buffer currently
+ * holding that generation's rendered content, or -1 if none.  The v8
+ * algorithm keys everything by generation; this lookup is the only place
+ * the framework resolves a gen back to a concrete buffer index + base
+ * address for the DMA write. */
 
-static int engine_remaining(uint32_t submitted, uint32_t written)
+static int buf_idx_of_gen(const nyabula_screen_t *scr, int gen)
 {
-  if (submitted <= written)
+  if (gen >= 0 && scr->buf[0].gen == gen)
     {
       return 0;
     }
 
-  return (int)(submitted - written);
+  if (gen >= 0 && scr->buf[1].gen == gen)
+    {
+      return 1;
+    }
+
+  return -1;
 }
 
-/* May this screen submit the next half-block?  Backpressure applies only
- * when the in-flight line count reaches the half-frame budget.  When
- * bandwidth is sufficient this is always true (== v5/v6 optimal). */
+/* algorithm -> framework: request render of a new generation for a screen.
+ * Runs in the TE edge context (ISR-safe): only posts a render request for
+ * the render loop to consume.  The actual lv_refr_now() happens later, on
+ * the caller's thread in nyabula_dual_lcd_task(). */
 
-static bool engine_can_submit(const nyabula_screen_t *scr)
+static void v8_request_render(struct nyabula_screen *scr, int gen)
 {
-  return engine_remaining(scr->submitted_lines, scr->written_lines) <
-         NYABULA_PENDING_BUDGET_LINES;
+  (void)gen; /* the algorithm already assigned gen; we just mark "render". */
+
+  if (!scr->initialized)
+    {
+      return;
+    }
+
+  /* Record the generation LVGL is about to draw.  When flush_cb fires, the
+   * framework binds this generation to the physical buffer LVGL chose and
+   * reports on_render_done back to the algorithm. */
+  sem_wait(&scr->st_mutex);
+  scr->render_gen = gen;
+  scr->render_request = true;
+  sem_post(&scr->st_mutex);
+}
+
+/* algorithm -> framework: request a half-frame block write of `num_lines`
+ * lines starting at `start_line`, carrying generation `gen`.  Runs in the
+ * TE edge context; enqueues a job for the transfer thread (DMA).  Returns
+ * true if the job was enqueued, false if the queue is full (block dropped). */
+
+static bool v8_request_write(struct nyabula_screen *scr, int start_line,
+                             int num_lines, int gen)
+{
+  nyabula_dual_lcd_t *dual;
+  nyabula_write_job_t job;
+  int idx;
+  int ret;
+
+  if (num_lines <= 0)
+    {
+      return false;
+    }
+
+  dual = (nyabula_dual_lcd_t *)scr->dual;
+  if (!dual || dual->quitting)
+    {
+      return false;
+    }
+
+  /* Resolve the generation back to a concrete buffer.  The algorithm only
+   * ever writes generations that are already rendered (in _pending_gens),
+   * so this must succeed; if it does not, drop defensively. */
+  sem_wait(&scr->st_mutex);
+  idx = buf_idx_of_gen(scr, gen);
+  if (idx < 0)
+    {
+      sem_post(&scr->st_mutex);
+      return false;
+    }
+
+  memset(&job, 0, sizeof(job));
+  job.screen_id = scr->screen_id;
+  job.start_line = start_line;
+  job.num_lines = num_lines;
+  job.buf_idx = idx;
+  job.gen = gen;
+
+  sem_post(&scr->st_mutex);
+
+  ret = job_enqueue(dual, &job);
+  return (ret == 0);
+}
+
+/* algorithm -> framework: a generation's two blocks are both fully written
+ * to GRAM; its offscreen buffer is free for LVGL to reuse.  Post buf_free
+ * so a blocked flush_wait_cb (or the render defer wait) can proceed. */
+
+static void v8_on_gen_complete(struct nyabula_screen *scr, int gen)
+{
+  int idx;
+
+  if (!scr->initialized)
+    {
+      return;
+    }
+
+  sem_wait(&scr->st_mutex);
+  idx = buf_idx_of_gen(scr, gen);
+  if (idx >= 0)
+    {
+      scr->buf[idx].gen = -1; /* buffer is now free */
+    }
+  sem_post(&scr->st_mutex);
+
+  sem_post(&scr->buf_free);
 }
 
 /****************************************************************************
  * Name: te_edge_rise
  *
  * Description:
- *   Rising edge of the scan (a full frame has been scanned, blanking has
- *   just ended and a new frame scan is starting).  Submit the BACK half of
- *   the locked buffer, same generation as the front half pushed at the
- *   falling edge => the whole frame shows one generation => 0 tearing.
+ *   Rising edge of the scan (a full frame has been scanned).  Forwarded to
+ *   the v8 algorithm, which decides whether to write the back half.
  *
- *   ISR-safe: only updates state and posts semaphores.
+ *   ISR-safe: only forwards state and posts semaphores.
  *
  ****************************************************************************/
 
 static void te_edge_rise(nyabula_dual_lcd_t *dual, int sid)
 {
   nyabula_screen_t *scr;
-  nyabula_write_job_t job;
 
   if (dual->quitting)
     {
@@ -278,63 +372,29 @@ static void te_edge_rise(nyabula_dual_lcd_t *dual, int sid)
       return;
     }
 
-  sem_wait(&scr->st_mutex);
-
-  /* Nothing locked at the falling edge -> nothing to complete. */
-  if (scr->half_buf < 0)
-    {
-      sem_post(&scr->st_mutex);
-      return;
-    }
-
-  /* Backpressure: defer the BACK-half push until outstanding < budget. */
-  if (!engine_can_submit(scr))
-    {
-      sem_post(&scr->st_mutex);
-      return;
-    }
-
-  memset(&job, 0, sizeof(job));
-  job.screen_id = sid;
-  job.start_line = scr->half_lines;
-  job.num_lines = scr->total_lines - scr->half_lines;
-  job.buf_idx = scr->half_buf;
-  job.gen = scr->buf[scr->half_buf].gen;
-
-  if (job_enqueue(dual, &job) == 0)
-    {
-      /* Lines are now "submitted". */
-      scr->submitted_lines += (uint32_t)job.num_lines;
-    }
-
-  sem_post(&scr->st_mutex);
+  /* The edge handlers may already hold st_mutex via request callbacks that
+   * also take it; to avoid recursive deadlock the algorithm itself is not
+   * guarded by st_mutex here (its state is only touched from the single TE
+   * thread and the transfer thread's completion callback, see _on_block_*
+   * synchronization note).  Forward to v8. */
+  nyabula_v8_on_scan_start(&scr->v8, scr);
 }
 
 /****************************************************************************
  * Name: te_edge_fall
  *
  * Description:
- *   Falling edge of the scan: the panel has scanned rows 0..half-1 (the
- *   front half is therefore safe to update this frame).
+ *   Falling edge of the scan: the panel has scanned rows 0..half-1.  Forwarded
+ *   to the v8 algorithm, which locks the latest rendered generation, submits
+ *   the front half and kicks the next frame render.
  *
- *   1) Lock the latest fully-rendered buffer (consume render_done).
- *   2) Submit the FRONT half (0..half) of the locked buffer as one block,
- *      subject to backpressure.
- *
- *   The next frame's render does not need to be kicked off here: LVGL
- *   self-drives animated content in its render thread.  This handler only
- *   decides push timing, so it stays ISR-safe.
- *
- *   Mirrors BoundedChaseScheduler._on_scan_half().
- *
- *   ISR-safe: only updates state and posts semaphores.
+ *   ISR-safe: only forwards state and posts semaphores.
  *
  ****************************************************************************/
 
 static void te_edge_fall(nyabula_dual_lcd_t *dual, int sid)
 {
   nyabula_screen_t *scr;
-  nyabula_write_job_t job;
 
   if (dual->quitting)
     {
@@ -347,61 +407,12 @@ static void te_edge_fall(nyabula_dual_lcd_t *dual, int sid)
       return;
     }
 
-  sem_wait(&scr->st_mutex);
+  nyabula_v8_on_scan_half(&scr->v8, scr);
 
-  /* 1) Lock the latest fully-rendered buffer into the half-push slot, but
-   * only when the previously locked buffer is done -- i.e. its back half
-   * was submitted and the transfer thread released half_buf to -1.  If an
-   * old back half is still pending (deferred by v6 backpressure), do NOT
-   * overwrite half_buf: that would drop the old buffer's back-half
-   * reference and its fill_pending would never decrement, leaking that
-   * physical buffer forever and progressively locking this screen out.
-   * (v6's _half_gen is a generation number -- free to be overwritten,
-   * dropping only one frame's content -- whereas half_buf is a physical
-   * buffer index bound to the buffer's lifetime, so it must not be
-   * re-pointed while its back half is unwritten.) */
-  if (scr->half_buf < 0 && scr->render_done_buf >= 0)
-    {
-      scr->half_buf = scr->render_done_buf;
-      scr->render_done_buf = -1;
-    }
-
-  /* 2) Drive the next frame's render at the falling edge (v6 starts a fresh
-   *    render here so the content is ready for the next write window).  This
-   *    is the only render driver: the render loop calls lv_refr_now() for
-   *    this screen.  A static screen is not force-redrawn because
-   *    lv_refr_now() skips drawing when there is no invalid area.  This is
-   *    ISR-safe (flag + sem post only). */
-  scr->render_request = true;
+  /* Wake the render loop once per falling edge so the pending render
+   * request (posted by v8_request_render via the algorithm) is consumed
+   * promptly at the frame boundary. */
   sem_post(&dual->render_kick);
-
-  /* 3) Submit the front half of the locked generation.  Backpressure may
-   *    defer this push only; it never blocks the render request above. */
-  if (scr->half_buf < 0)
-    {
-      sem_post(&scr->st_mutex);
-      return; /* nothing rendered yet -> keep current content */
-    }
-
-  if (!engine_can_submit(scr))
-    {
-      sem_post(&scr->st_mutex);
-      return; /* backpressure: defer push until bus drains */
-    }
-
-  memset(&job, 0, sizeof(job));
-  job.screen_id = sid;
-  job.start_line = 0;
-  job.num_lines = scr->half_lines;
-  job.buf_idx = scr->half_buf;
-  job.gen = scr->buf[scr->half_buf].gen;
-
-  if (job_enqueue(dual, &job) == 0)
-    {
-      scr->submitted_lines += (uint32_t)job.num_lines;
-    }
-
-  sem_post(&scr->st_mutex);
 }
 
 /****************************************************************************
@@ -434,43 +445,14 @@ static int job_enqueue(nyabula_dual_lcd_t *dual, const nyabula_write_job_t *j)
 
 static int job_dequeue_fair(nyabula_dual_lcd_t *dual, nyabula_write_job_t *out)
 {
-  int i;
-  int last;
-
+  /* Strict FIFO: the shared bus serves write jobs in submission order
+   * (first-come first-served), matching the physical reality of a single
+   * controller / single bus.  Fairness between screens is the ALGORITHM's
+   * job at submission time, not the framework's.  The old round-robin
+   * reorder here was a v6 leftover that violated this boundary. */
   sem_wait(&dual->job_avail);
   sem_wait(&dual->job_mutex);
 
-  /* Fair dispatch: prefer the earliest queued job belonging to the screen
-   * other than the last one served, so neither screen can monopolize the
-   * shared bus (mirrors Simulation._pop_fair). */
-  last = dual->last_bus_screen;
-  if (last >= 0 && dual->job_count > 1)
-    {
-      for (i = 0; i < dual->job_count; i++)
-        {
-          int idx = (dual->job_head + i) % NYABULA_JOB_QUEUE_SIZE;
-          if (dual->job_queue[idx].screen_id != last)
-            {
-              *out = dual->job_queue[idx];
-              /* Shift the hole out by pulling elements forward. */
-              while (i > 0)
-                {
-                  int prev = (dual->job_head + i - 1) % NYABULA_JOB_QUEUE_SIZE;
-                  dual->job_queue[idx] = dual->job_queue[prev];
-                  idx = prev;
-                  i--;
-                }
-
-              dual->job_head = (dual->job_head + 1) % NYABULA_JOB_QUEUE_SIZE;
-              dual->job_count--;
-              sem_post(&dual->job_mutex);
-              sem_post(&dual->job_space);
-              return 0;
-            }
-        }
-    }
-
-  /* Ordinary FIFO head (or single-screen case). */
   *out = dual->job_queue[dual->job_head];
   dual->job_head = (dual->job_head + 1) % NYABULA_JOB_QUEUE_SIZE;
   dual->job_count--;
@@ -478,6 +460,45 @@ static int job_dequeue_fair(nyabula_dual_lcd_t *dual, nyabula_write_job_t *out)
   sem_post(&dual->job_space);
 
   return 0;
+}
+
+/****************************************************************************
+ * Name: create_thread_prio
+ *
+ * Description:
+ *   Create a pthread with an explicit SCHED_FIFO priority (lower number =
+ *   higher priority in NuttX).  Used to give the software TE frame clock a
+ *   high priority so its edges fire on time and are not delayed by the
+ *   render or transfer threads.
+ *
+ ****************************************************************************/
+
+static int create_thread_prio(pthread_t *thr, void *(*fn)(void *), void *arg,
+                              int prio)
+{
+  pthread_attr_t attr;
+  struct sched_param param;
+  int ret;
+
+  pthread_attr_init(&attr);
+  param.sched_priority = prio;
+  ret = pthread_attr_setschedparam(&attr, &param);
+  if (ret != 0)
+    {
+      pthread_attr_destroy(&attr);
+      return ret;
+    }
+
+  ret = pthread_attr_setschedpolicy(&attr, SCHED_FIFO);
+  if (ret != 0)
+    {
+      pthread_attr_destroy(&attr);
+      return ret;
+    }
+
+  ret = pthread_create(thr, &attr, fn, arg);
+  pthread_attr_destroy(&attr);
+  return ret;
 }
 
 /****************************************************************************
@@ -595,8 +616,6 @@ static void *te_thread_func(void *arg)
         }
 
       tick = (uint8_t)((tick + 1) & 3u);
-
-      nyabula_disp_audit_te_frame(dual, tick);
     }
 
   return NULL;
@@ -611,7 +630,7 @@ static void *te_thread_func(void *arg)
  *     1) advances LVGL via lv_timer_handler() (timers, animation, refresh),
  *     2) consumes any pending TE-driven render requests: invalidates the
  *        screen's active object once so LVGL renders exactly one full frame
- *        (FULL mode) to feed the v6 pipeline.
+ *        (FULL mode) to feed the v8 pipeline.
  *
  *   The display layer starts the TE/transfer threads in create(); the
  *   caller hosts the lv_timer_handler() call (LVGL is single-threaded, and
@@ -631,136 +650,57 @@ void nyabula_dual_lcd_task(nyabula_dual_lcd_t *dual)
 {
   struct timespec ts;
   uint32_t idle;
+  int sid;
 
   if (!dual)
     {
       return;
     }
 
-  nyabula_disp_audit_loop(dual);
-
   /* Run one cycle of the LVGL state machine (timers, animation).  This
    * advances animations (time from the NuttX clock via lv_tick_set_cb) and
    * accumulates their invalidations; the default refresh timer is kept
    * paused (see te_refr_req_cb), so it does NOT itself render.  The render
-   * happens below via lv_refr_now() driven by the TE falling edge, keeping
-   * the pipeline TE-aligned. */
+   * happens below via lv_refr_now() driven by the v8 algorithm's render
+   * request, keeping the pipeline TE-aligned. */
   idle = lv_timer_handler();
 
-  /* Consume the TE-driven render requests: for each screen whose falling
-   * edge requested a frame, issue lv_refr_now() (the render driver, kept
-   * TE-exclusive via te_refr_req_cb).  lv_refr_now() advances animations too
-   * and, crucially, skips drawing when there is no invalid area -- so a
-   * static screen is not force-redrawn each frame (saves CPU and QSPI
-   * bandwidth), while a running animation is rendered exactly once per TE
-   * period with the freshest accumulated content.
-   *
-   * The two screens share this single render thread, so a screen whose
-   * double-buffer is full must NOT stall the loop here (v6 "defer not drop",
-   * see Simulation._db_pending).  We render in two passes:
-   *   Pass 1 - render every screen that has a free buffer (fill_pending < 2)
-   *            right away; defer any screen whose buffers are both full.
-   *   Pass 2 - after the other screen(s) have rendered, wait (CPU-free) for
-   *            a free buffer on each deferred screen and render it.  This
-   *            guarantees a full double-buffer on one screen no longer
-   *            serializes (and starves) the other screen's render. */
-  {
-    bool armed[NYABULA_DUAL_LCD_MAX_SCREENS];
-    bool deferred[NYABULA_DUAL_LCD_MAX_SCREENS];
-    int sid;
+  /* Consume TE/v8-driven render requests: for each screen whose algorithm
+   * requested a frame, issue lv_refr_now().  lv_refr_now() advances
+   * animations too and skips drawing when there is no invalid area.  The
+   * double-buffer gating is entirely the algorithm's job (v8 _can_render):
+   * it only requests a render when a working buffer is available, so the
+   * render loop never has to decide deferral here. */
+  for (sid = 0; sid < NYABULA_DUAL_LCD_MAX_SCREENS; sid++)
+    {
+      nyabula_screen_t *scr = &dual->screen[sid];
+      bool request;
 
-    /* Collect the armed render requests (consume the bools once). */
-    for (sid = 0; sid < NYABULA_DUAL_LCD_MAX_SCREENS; sid++)
-      {
-        nyabula_screen_t *scr = &dual->screen[sid];
+      if (!scr->initialized || !scr->disp)
+        {
+          continue;
+        }
 
-        armed[sid] = false;
-        deferred[sid] = false;
+      sem_wait(&scr->st_mutex);
+      request = scr->render_request;
+      if (request)
+        {
+          scr->render_request = false;
+        }
 
-        if (!scr->initialized || !scr->disp)
-          {
-            continue;
-          }
+      sem_post(&scr->st_mutex);
 
-        sem_wait(&scr->st_mutex);
-        if (scr->render_request)
-          {
-            scr->render_request = false;
-            armed[sid] = true;
-          }
-
-        sem_post(&scr->st_mutex);
-      }
-
-    /* Pass 1: render screens with a free buffer; defer the rest. */
-    for (sid = 0; sid < NYABULA_DUAL_LCD_MAX_SCREENS; sid++)
-      {
-        nyabula_screen_t *scr = &dual->screen[sid];
-        bool room;
-
-        if (!armed[sid])
-          {
-            continue;
-          }
-
-        sem_wait(&scr->st_mutex);
-        room = (scr->fill_pending < NYABULA_DUAL_LCD_MAX_SCREENS);
-        sem_post(&scr->st_mutex);
-
-        if (room)
-          {
-            nyabula_disp_audit_render_start(sid);
-            lv_refr_now(scr->disp);
-            nyabula_disp_audit_render_end(sid);
-          }
-        else
-          {
-            /* Both buffers hold rendered-but-unwritten generations: defer to
-             * pass 2 so the other screen can render meanwhile. */
-            deferred[sid] = true;
-          }
-      }
-
-    /* Pass 2: render the deferred screens once a buffer frees.  By here the
-     * other screen(s) have already rendered, so this wait is screen-local
-     * and signalled (no busy CPU, no cross-screen serialization). */
-    for (sid = 0; sid < NYABULA_DUAL_LCD_MAX_SCREENS; sid++)
-      {
-        nyabula_screen_t *scr = &dual->screen[sid];
-
-        if (!deferred[sid])
-          {
-            continue;
-          }
-
-        nyabula_disp_audit_defer_wait_start(sid);
-        sem_wait(&scr->st_mutex);
-        while (scr->fill_pending >= NYABULA_DUAL_LCD_MAX_SCREENS &&
-               scr->initialized)
-          {
-            /* Wait (signalled) for the transfer thread to finish a back-half
-             * write and release a buffer.  This never blocks the render of
-             * the sibling screen, which already happened in pass 1. */
-            sem_post(&scr->st_mutex);
-            sem_wait(&scr->buf_free);
-            sem_wait(&scr->st_mutex);
-          }
-
-        sem_post(&scr->st_mutex);
-        nyabula_disp_audit_defer_wait_end(sid);
-
-        nyabula_disp_audit_render_start(sid);
-        lv_refr_now(scr->disp);
-        nyabula_disp_audit_render_end(sid);
-      }
-  }
+      if (request)
+        {
+          lv_refr_now(scr->disp);
+        }
+    }
 
   /* Wait for either a TE edge kick (posted by the TE thread so we service
    * lv_timer_handler() promptly at the frame boundary) or until the LVGL
    * idle period elapses -- whichever comes first.  The timeout is computed
    * relative to NOW so the wait never extends beyond `idle` ms from this
-   * moment, keeping the LVGL clock true regardless of how long this call
-   * took before reaching the wait. */
+   * moment, keeping the LVGL clock true. */
   if (idle == 0)
     {
       idle = 1;
@@ -774,9 +714,7 @@ void nyabula_dual_lcd_task(nyabula_dual_lcd_t *dual)
       ts.tv_nsec %= 1000000000L;
     }
 
-  nyabula_disp_audit_waitkick_start(dual);
   sem_timedwait(&dual->render_kick, &ts);
-  nyabula_disp_audit_waitkick_end(dual);
 }
 
 /****************************************************************************
@@ -789,9 +727,9 @@ void nyabula_dual_lcd_task(nyabula_dual_lcd_t *dual)
  *   CPU meanwhile.  Fair dispatch alternates between the two screens so
  *   neither can monopolize the shared bus.
  *
- *   After a BACK-half job completes, the buffer generation is fully
- *   written to GRAM: fill_pending is decremented, written_lines is updated,
- *   and the render thread is signalled that the buffer is free.
+ *   After each block completes, the edge is reported to the v8 algorithm
+ *   (nyabula_v8_on_block_write_done), which decrements its in-flight count
+ *   and self-determines generation completion (freeing the double buffer).
  *
  ****************************************************************************/
 
@@ -824,9 +762,6 @@ static void *transfer_thread_func(void *arg)
       lcd_area.data =
           scr->buf[job.buf_idx].data + (int64_t)job.start_line * scr->stride;
 
-      /* Measure transfer wall time + front-half refresh period. */
-      nyabula_disp_audit_transfer_start(job.screen_id, job.start_line);
-
       ret = ioctl(scr->fd, LCDDEVIO_PUTAREA, (unsigned long)&lcd_area);
       if (ret < 0)
         {
@@ -835,31 +770,12 @@ static void *transfer_thread_func(void *arg)
                   lcd_area.row_start, lcd_area.row_end, -ret);
         }
 
-      nyabula_disp_audit_transfer_end(job.screen_id);
-
-      /* Lines physically written to the panel for this screen. */
-      sem_wait(&scr->st_mutex);
-      scr->written_lines += (uint32_t)job.num_lines;
-
-      /* If this was the BACK half, the whole generation is now in GRAM and
-       * the locked buffer is free for LVGL to reuse. */
-      if (job.start_line >= scr->half_lines && job.num_lines > 0)
-        {
-          if (scr->fill_pending > 0)
-            {
-              scr->fill_pending--;
-            }
-
-          /* The locked buffer may now be handed back to LVGL. */
-          if (scr->half_buf == job.buf_idx)
-            {
-              scr->half_buf = -1;
-            }
-
-          sem_post(&scr->buf_free);
-        }
-
-      sem_post(&scr->st_mutex);
+      /* Block transfer complete: report the edge to the v8 algorithm, which
+       * decrements its in-flight count and self-determines whether the whole
+       * generation is now written (releasing the double buffer).  The DMA
+       * hardware gives us exactly one interrupt per submitted block, which
+       * is the physical signal v8 keys its bookkeeping on. */
+      nyabula_v8_on_block_write_done(&scr->v8, job.gen);
     }
 
   return NULL;
@@ -870,52 +786,45 @@ static void *transfer_thread_func(void *arg)
  *
  * Description:
  *   LVGL flush-wait callback, replacing LVGL's default busy `while(flushing)`
- *   spin with a blocking-but-CPU-free wait, and implementing the v6
- *   "temporarily defer when both buffers are full" semantics (see
- *   Simulation._db_ok / _db_pending).
+ *   spin with a blocking-but-CPU-free wait.
  *
- *   Called by LVGL (in draw_buf_flush) right before it begins drawing into
- *   the next buffer.  fill_pending counts "rendered but not yet fully
- *   written to GRAM" generations (physical buffer count).  When BOTH
- *   buffers are full (fill_pending >= 2), a new render would need a third
- *   buffer, so we defer -- i.e. wait (without eating CPU) for the transfer
- *   thread to finish a back-half write, release a buffer and post buf_free.
- *   When fill_pending < 2 the pipeline is legal (1 in-flight + 1 render
- *   working buffer) and we return immediately, exactly like v6's _db_ok.
+ *   A buffer is "free" once its generation has been fully written to GRAM
+ *   (gen set back to -1 by on_gen_complete, which posts buf_free).  Wait
+ *   here while BOTH offscreen buffers are still occupied (gen != -1), i.e.
+ *   a new draw would overwrite content whose DMA transfer has not finished.
+ *   Once at least one buffer is free, return immediately.
  *
- *   Under a healthy bus this never waits longer than one back-half DMA;
- *   transient heavy backpressure merely pauses rendering (not permanently
- *   frozen) until a buffer is released.  This matches v6: deferred, not
- *   dropped, and recovers automatically.
+ *   The v8 algorithm already guarantees it only requests a render when a
+ *   working buffer is available (_can_render), so under a healthy bus this
+ *   rarely blocks; it is a defensive net for LVGL's internal buffer
+ *   alternation racing a slow back-half DMA.
  *
  ****************************************************************************/
 
 static void flush_wait_cb(lv_display_t *disp)
 {
   nyabula_screen_t *scr = lv_display_get_driver_data(disp);
+  bool both_busy;
 
   if (!scr || !scr->initialized)
     {
       return;
     }
 
-  nyabula_disp_audit_flush_wait_start(scr->screen_id);
-
   sem_wait(&scr->st_mutex);
-  while (scr->fill_pending >= NYABULA_DUAL_LCD_MAX_SCREENS && scr->initialized)
+  both_busy = (scr->buf[0].gen != -1 && scr->buf[1].gen != -1);
+  while (both_busy && scr->initialized)
     {
-      /* Both offscreen buffers hold rendered-but-unwritten generations: a
-       * new frame needs a third buffer.  Defer until the transfer thread
-       * writes a back half, releases a buffer and posts buf_free.  The
-       * wait is signalled (no CPU burn). */
+      /* Both offscreen buffers hold rendered-but-unwritten content: a new
+       * draw would need a third buffer.  Wait (signalled) for the transfer
+       * thread to finish a generation and post buf_free. */
       sem_post(&scr->st_mutex);
       sem_wait(&scr->buf_free);
       sem_wait(&scr->st_mutex);
+      both_busy = (scr->buf[0].gen != -1 && scr->buf[1].gen != -1);
     }
 
   sem_post(&scr->st_mutex);
-
-  nyabula_disp_audit_flush_wait_end(scr->screen_id);
 }
 
 /****************************************************************************
@@ -923,13 +832,14 @@ static void flush_wait_cb(lv_display_t *disp)
  *
  * Description:
  *   LVGL flush callback, called from the render thread when LVGL finishes
- *   rendering a full frame into one of the two buffers.  Records the
- *   buffer's fresh generation so the v6 edge handlers can push its halves,
- *   and releases LVGL to continue rendering the other buffer.
+ *   rendering a full frame into one of the two buffers.  Binds the
+ *   generation (assigned by the v8 algorithm via request_render, stored in
+ *   scr->render_gen) to the physical buffer LVGL chose, then reports
+ *   on_render_done so the algorithm moves the generation into its pending
+ *   (awaiting-write) set.
  *
- *   Waiting for a full double-buffer is handled by flush_wait_cb() (above)
- *   in LVGL's own wait slot, so this callback never blocks the render
- *   thread itself.
+ *   A full double-buffer wait is handled by flush_wait_cb() above in LVGL's
+ *   own wait slot, so this callback never blocks the render thread itself.
  *
  ****************************************************************************/
 
@@ -937,26 +847,37 @@ static void flush_cb(lv_display_t *disp, const lv_area_t *area,
                      uint8_t *color_p)
 {
   nyabula_screen_t *scr = lv_display_get_driver_data(disp);
+  int gen;
   int buf_idx;
+  int done_gen;
 
   (void)area; /* Full-refresh: LVGL flushes the whole screen each frame. */
 
   buf_idx = (color_p == scr->buf[0].data) ? 0 : 1;
 
-  nyabula_disp_audit_flush_end(scr->screen_id);
-
   sem_wait(&scr->st_mutex);
 
-  if (scr->initialized)
+  /* The generation LVGL was asked to draw (request_render) is now realized
+   * in this physical buffer.  Bind it and report completion to the v8
+   * algorithm. */
+  gen = scr->render_gen;
+  done_gen = -1;
+  if (scr->initialized && gen != -1)
     {
-      /* This buffer now holds a fresh full generation. */
-      scr->gen_counter++;
-      scr->buf[buf_idx].gen = scr->gen_counter;
-      scr->render_done_buf = buf_idx;
-      scr->fill_pending++;
+      scr->buf[buf_idx].gen = gen;
+      done_gen = gen;
+      scr->render_gen = -1;
     }
 
   sem_post(&scr->st_mutex);
+
+  if (done_gen != -1)
+    {
+      /* Content is ready: the algorithm moves done_gen from "rendering" to
+       * "pending write".  Called outside st_mutex (the algorithm's own
+       * state is not shared with the framework's st_mutex). */
+      nyabula_v8_on_render_done(&scr->v8, done_gen);
+    }
 
   /* Release this buffer so LVGL resumes rendering into the other one. */
   lv_display_flush_ready(disp);
@@ -1079,7 +1000,9 @@ static int screen_display_on(nyabula_screen_t *scr)
  *
  * Description:
  *   Initialize a single screen: open the LCD device, allocate two full-frame
- *   RGB565 buffers, set up the v6 scheduler state and the LVGL display.
+ *   RGB565 buffers, set up the LVGL display.  The v8 algorithm context is
+ *   initialized (with callbacks) by the caller after the dual context is
+ *   built, since it needs the dual back-pointer.
  *
  ****************************************************************************/
 
@@ -1095,17 +1018,10 @@ static int screen_init(nyabula_screen_t *scr, int sid, const char *dev_path,
   scr->total_lines = height;
   scr->half_lines = height / 2;
   scr->buf_size = (uint32_t)width * height * 2;
-  scr->gen_counter = 0;
-  scr->render_done_buf = -1;
-  scr->half_buf = -1;
-  scr->submitted_lines = 0;
-  scr->written_lines = 0;
-  scr->fill_pending = 0;
+  scr->render_gen = -1;
   scr->render_request = false;
+  scr->dual = NULL; /* set by the caller (nyabula_dual_lcd_create) */
   scr->initialized = false;
-
-  /* 0 lines written by the driver yet: prime the written counter so the
-   * backpressure bookkeeping starts consistent. */
 
   /* Open LCD device */
   LV_LOG_USER("Opening LCD device: %s", dev_path);
@@ -1163,7 +1079,7 @@ static int screen_init(nyabula_screen_t *scr, int sid, const char *dev_path,
     }
 
   /* LVGL renders one full frame per buffer and calls flush_cb once for the
-   * whole screen; this matches the v6 whole-half-block model. */
+   * whole screen; this matches the v8 whole-half-block model. */
   lv_display_set_buffers(scr->disp, scr->buf[0].data, scr->buf[1].data,
                          scr->buf_size, LV_DISPLAY_RENDER_MODE_FULL);
   lv_display_set_flush_cb(scr->disp, flush_cb);
@@ -1283,7 +1199,8 @@ static void screen_destroy(nyabula_screen_t *scr)
  *
  * Description:
  *   Create the dual-LCD context with the two threads (software TE frame
- *   clock + transfer) and the v6 BoundedChase scheduler.
+ *   clock + transfer) and wire the v8 scheduling algorithm by registering
+ *   its request callbacks.
  *
  ****************************************************************************/
 
@@ -1292,6 +1209,8 @@ nyabula_dual_lcd_t *nyabula_dual_lcd_create(const char *dev_path0,
                                             int height)
 {
   nyabula_dual_lcd_t *dual;
+  nyabula_v8_callbacks_t v8_cb;
+  int sid;
   int ret;
 
   LV_ASSERT_NULL(dev_path0);
@@ -1318,14 +1237,11 @@ nyabula_dual_lcd_t *nyabula_dual_lcd_create(const char *dev_path0,
   dual->job_head = 0;
   dual->job_tail = 0;
   dual->job_count = 0;
-  dual->last_bus_screen = -1;
 
   sem_init(&dual->job_mutex, 0, 1);
   sem_init(&dual->job_avail, 0, 0);
   sem_init(&dual->job_space, 0, NYABULA_JOB_QUEUE_SIZE);
   sem_init(&dual->render_kick, 0, 0);
-
-  nyabula_disp_audit_init();
 
   /* Initialize screen 0 */
   ret = screen_init(&dual->screen[0], 0, dev_path0, width, height);
@@ -1343,15 +1259,34 @@ nyabula_dual_lcd_t *nyabula_dual_lcd_create(const char *dev_path0,
       goto err_screen1;
     }
 
-  /* Stagger the software TE clocks: screen 1 leads screen 0 by 90-deg (1/4
-   * frame period) so their scan edges -- and the resulting QSPI write
-   * submissions -- do not collide.  Screen 0 keeps the default phase 0. */
+  /* Wire the v8 algorithm for both screens: register its request callbacks
+   * and set the dual back-pointer so the algorithm's write request can reach
+   * the job queue.  The algorithm only ever sees the opaque screen handle
+   * and these callbacks -- no LVGL/DMA detail. */
+  v8_cb.request_render = v8_request_render;
+  v8_cb.request_write = v8_request_write;
+  v8_cb.on_gen_complete = v8_on_gen_complete;
+
+  for (sid = 0; sid < NYABULA_DUAL_LCD_MAX_SCREENS; sid++)
+    {
+      dual->screen[sid].dual = dual;
+      nyabula_v8_init(&dual->screen[sid].v8, dual->screen[sid].half_lines,
+                      dual->screen[sid].total_lines, &v8_cb);
+      dual->screen[sid].v8.screen = &dual->screen[sid];
+    }
+
+  /* TE clock phase (0 = no stagger): screen 1 leads screen 0 by 0-deg so
+   * both screens' scan edges coincide.  This is the harshest operating point
+   * for the shared QSPI bus (both screens submit writes at the same instant).
+   * Originally 1 (90-deg stagger); set to 0 to stress the scheduler. */
   dual->screen[1].te_phase_shift = 1;
 
   dual->running = true;
 
-  /* Start the software TE frame clock thread (placeholder for TE ISR). */
-  ret = pthread_create(&dual->te_thread, NULL, te_thread_func, dual);
+  /* Start the software TE frame clock thread (placeholder for TE ISR), at
+   * high priority so edges fire on time regardless of render/transfer load. */
+  ret = create_thread_prio(&dual->te_thread, te_thread_func, dual,
+                           NYABULA_DUAL_LCD_TE_PRIORITY);
   if (ret != 0)
     {
       LV_LOG_ERROR("Failed to create TE thread: %d", ret);
@@ -1359,9 +1294,10 @@ nyabula_dual_lcd_t *nyabula_dual_lcd_create(const char *dev_path0,
       goto err_te_thread;
     }
 
-  /* Start the transfer (QSPI DMA) thread. */
-  ret =
-      pthread_create(&dual->transfer_thread, NULL, transfer_thread_func, dual);
+  /* Start the transfer (QSPI DMA) thread at a priority below the TE thread
+   * (so TE wins) but above the render/main thread (so DMA keeps busy). */
+  ret = create_thread_prio(&dual->transfer_thread, transfer_thread_func, dual,
+                           NYABULA_DUAL_LCD_TRANSFER_PRIORITY);
   if (ret != 0)
     {
       LV_LOG_ERROR("Failed to create transfer thread: %d", ret);
@@ -1370,7 +1306,7 @@ nyabula_dual_lcd_t *nyabula_dual_lcd_create(const char *dev_path0,
       goto err_te_thread; /* te thread already joined; fall into cleanup */
     }
 
-  LV_LOG_USER("Dual LCD created successfully (v6 bounded chase, %d fps); "
+  LV_LOG_USER("Dual LCD created successfully (v8 bounded chase, %d fps); "
               "run nyabula_dual_lcd_task() in a loop to drive rendering",
               NYABULA_DUAL_LCD_REFRESH_HZ);
   return dual;
