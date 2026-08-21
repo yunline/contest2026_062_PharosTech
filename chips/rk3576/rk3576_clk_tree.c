@@ -2349,6 +2349,249 @@ static void rk3576_clk_register_dmac(void)
 }
 #endif /* CONFIG_RK3576_DMA */
 
+/**
+ * Macro: RK3576_CLK_REGISTER_TIMER_ROOT_ONE
+ *
+ * Register one timer root clock (1-bit mux + gate). the mux
+ * sits in a CLKSEL_CON register and the root gate in a
+ * GATE_CON register.
+ *
+ * Parameters:
+ *   id        - root index (0 or 1), used in clock name suffix
+ *   sel_reg   - CLKSEL register address (1-bit mux)
+ *   sel_shift - mux bit offset
+ *   gate_reg  - GATE register address
+ *   gate_bit  - root gate bit
+ */
+
+#define RK3576_CLK_REGISTER_TIMER_ROOT_ONE(id, sel_reg, sel_shift, gate_reg,  \
+                                           gate_bit)                          \
+  do                                                                          \
+    {                                                                         \
+      struct clk_s *_mux;                                                     \
+                                                                              \
+      _mux = clk_register_mux("clk_timer" #id "_root_sel",                    \
+                              g_timer_root_sel_parents,                       \
+                              nitems(g_timer_root_sel_parents),               \
+                              CLK_SET_RATE_PARENT | CLK_NAME_IS_STATIC |      \
+                                  CLK_PARENT_NAME_IS_STATIC,                  \
+                              sel_reg, sel_shift, 1, CLK_MUX_HIWORD_MASK);    \
+      if (!_mux)                                                              \
+        {                                                                     \
+          _err("CLK: failed to register clk_timer" #id "_root_sel\n");        \
+          break;                                                              \
+        }                                                                     \
+                                                                              \
+      clk_register_gate("clk_timer" #id "_root", "clk_timer" #id "_root_sel", \
+                        CLK_SET_RATE_PARENT | CLK_NAME_IS_STATIC |            \
+                            CLK_PARENT_NAME_IS_STATIC,                        \
+                        gate_reg, gate_bit,                                   \
+                        CLK_GATE_HIWORD_MASK | CLK_GATE_SET_TO_DISABLE);      \
+    }                                                                         \
+  while (0)
+
+/**
+ * Macro: RK3576_CLK_REGISTER_TIMER_COMPOSITE_ONE
+ *
+ * Register one standalone timer channel clock (mux + divider + gate).
+ * the mux and the divider share a single CLKSEL_CON register
+ * in non-overlapping bitfields (same pattern as FSPI/UART),
+ * followed by a separate gate.
+ *
+ * Parameters:
+ *   id         - channel index (7 or 8), used in clock name suffix
+ *   sel_reg    - CLKSEL register address (shared by mux + divider)
+ *   mux_shift  - mux select bit offset
+ *   mux_width  - mux width (2 bits)
+ *   div_shift  - divider bit offset (5-bit, div_con + 1)
+ *   gate_reg   - GATE register address
+ *   gate_bit   - gate bit
+ *   parents    - parent name array
+ */
+
+#define RK3576_CLK_REGISTER_TIMER_COMPOSITE_ONE(id, sel_reg, mux_shift,      \
+                                                mux_width, div_shift,        \
+                                                gate_reg, gate_bit, parents) \
+  do                                                                         \
+    {                                                                        \
+      struct clk_s *_mux;                                                    \
+                                                                             \
+      _mux = clk_register_mux(                                               \
+          "clk_timer" #id "_sel", parents, nitems(parents),                  \
+          CLK_SET_RATE_PARENT | CLK_NAME_IS_STATIC |                         \
+              CLK_PARENT_NAME_IS_STATIC,                                     \
+          sel_reg, mux_shift, mux_width, CLK_MUX_HIWORD_MASK);               \
+      if (!_mux)                                                             \
+        {                                                                    \
+          _err("CLK: failed to register clk_timer" #id "_sel\n");            \
+          break;                                                             \
+        }                                                                    \
+                                                                             \
+      clk_register_divider("clk_timer" #id "_div", "clk_timer" #id "_sel",   \
+                           CLK_SET_RATE_PARENT | CLK_NAME_IS_STATIC |        \
+                               CLK_PARENT_NAME_IS_STATIC,                    \
+                           sel_reg, div_shift, 5, CLK_DIVIDER_HIWORD_MASK);  \
+                                                                             \
+      clk_register_gate("clk_timer" #id, "clk_timer" #id "_div",             \
+                        CLK_SET_RATE_PARENT | CLK_NAME_IS_STATIC |           \
+                            CLK_PARENT_NAME_IS_STATIC,                       \
+                        gate_reg, gate_bit,                                  \
+                        CLK_GATE_HIWORD_MASK | CLK_GATE_SET_TO_DISABLE);     \
+    }                                                                        \
+  while (0)
+
+/****************************************************************************
+ * Name: rk3576_clk_register_timer
+ *
+ * Description:
+ *   Register all TIMER clock muxes, dividers, and gates.  The register
+ *   mapping matches mainline drivers/clk/rockchip/clk-rk3576.c and the
+ *   TRM CRU chapter (Table 14-1).
+ *
+ *   Channel mapping (per TRM Table 14-1):
+ *     TIMER_NS_0 CH0..CH5 -> clk_timer0..clk_timer5
+ *     TIMER_NS_1 CH0..CH5 -> clk_timer6..clk_timer11
+ *
+ *   TIMER_NS_0:
+ *     clk_timer0_root: mux @ CLKSEL_CON(71)[14] (1-bit), gate GATE_CON(17)[5]
+ *     clk_timer0..5:   gates @ GATE_CON(17)[6..11], parent clk_timer0_root
+ *
+ *   TIMER_NS_1:
+ *     clk_timer1_root: mux @ CLKSEL_CON(72)[6] (1-bit), gate GATE_CON(18)[10]
+ *     clk_timer6/9/10: gates @ GATE_CON(18)[11]/[14]/[15]
+ *     clk_timer7:      mux @ CLKSEL_CON(72)[13:12] (2-bit, +lclk_asrc_src_0)
+ *                      div @ CLKSEL_CON(72)[11:7] (5-bit, div_con+1)
+ *                      gate @ GATE_CON(18)[12]
+ *     clk_timer8:      mux @ CLKSEL_CON(73)[6:5] (2-bit, +lclk_asrc_src_1)
+ *                      div @ CLKSEL_CON(73)[4:0] (5-bit, div_con+1)
+ *                      gate @ GATE_CON(18)[13]
+ *     clk_timer11:     gate @ GATE_CON(19)[0]
+ *
+ *   lclk_asrc_src_0/1 (the special third source of TIMER_NS_1 CH1/CH2)
+ *   are not modelled upstream and are intentionally NOT registered here:
+ *   their names stay in the clk_timer7/8 mux parent tables as dangling
+ *   parents.  clk_mux_determine_rate() skips any parent that resolves to
+ *   NULL, so the ASRC path is never auto-selected, and the framework's
+ *   orphan-reparent logic picks it up automatically once a real ASRC
+ *   clock is registered.  If the mux is forced to 2'b10 meanwhile,
+ *   clk_get_rate() returns 0.  Reset default of both muxes is 2'b01
+ *   (xin_osc0, 24 MHz); select 2'b00 for clk_cpll_div10 (100 MHz).
+ *
+ *   All gates use SET_TO_DISABLE (high = clock off).
+ ****************************************************************************/
+
+#ifdef CONFIG_RK3576_TIMER
+static void rk3576_clk_register_timer(void)
+{
+
+  /* TIMER: root mux parents.
+   * 0 = CPLL/10 (100 MHz), 1 = xin_osc0 (24 MHz).
+   * Used by clk_timer0_root_sel and clk_timer1_root_sel.
+   */
+
+  static const char *g_timer_root_sel_parents[] = {
+    "clk_cpll_div10", /* 0b0: 100 MHz */
+    "xin_osc0",       /* 0b1: 24 MHz */
+  };
+
+  /* TIMER_NS_1 CH1/CH2 (clk_timer7 / clk_timer8) add a third source from
+   * the ASRC matrix.
+   * lclk_asrc_src_0/1 are intentionally NOT registered (see the note in
+   * rk3576_clk_register_timer), so index 2 is a dangling parent: it is
+   * skipped by automatic rate selection and only resolves once the real
+   * ASRC clock exists.
+   */
+
+  static const char *g_timer7_sel_parents[] = {
+    "clk_cpll_div10",  /* 0b00: 100 MHz */
+    "xin_osc0",        /* 0b01: 24 MHz */
+    "lclk_asrc_src_0", /* 0b10: from ASRC matrix */
+  };
+
+  static const char *g_timer8_sel_parents[] = {
+    "clk_cpll_div10",  /* 0b00: 100 MHz */
+    "xin_osc0",        /* 0b01: 24 MHz */
+    "lclk_asrc_src_1", /* 0b10: from ASRC matrix */
+  };
+
+  const unsigned long cru = RK3576_CRU_ADDR;
+
+  /* TIMER_NS_0: root + CH0..CH5. */
+
+  RK3576_CLK_REGISTER_TIMER_ROOT_ONE(0, cru + RK3576_CRU_CLKSEL_CON(71), 14,
+                                     cru + RK3576_CRU_GATE_CON(17), 5);
+
+  clk_register_gate("clk_timer0", "clk_timer0_root",
+                    CLK_SET_RATE_PARENT | CLK_NAME_IS_STATIC |
+                        CLK_PARENT_NAME_IS_STATIC,
+                    cru + RK3576_CRU_GATE_CON(17), 6,
+                    CLK_GATE_HIWORD_MASK | CLK_GATE_SET_TO_DISABLE);
+  clk_register_gate("clk_timer1", "clk_timer0_root",
+                    CLK_SET_RATE_PARENT | CLK_NAME_IS_STATIC |
+                        CLK_PARENT_NAME_IS_STATIC,
+                    cru + RK3576_CRU_GATE_CON(17), 7,
+                    CLK_GATE_HIWORD_MASK | CLK_GATE_SET_TO_DISABLE);
+  clk_register_gate("clk_timer2", "clk_timer0_root",
+                    CLK_SET_RATE_PARENT | CLK_NAME_IS_STATIC |
+                        CLK_PARENT_NAME_IS_STATIC,
+                    cru + RK3576_CRU_GATE_CON(17), 8,
+                    CLK_GATE_HIWORD_MASK | CLK_GATE_SET_TO_DISABLE);
+  clk_register_gate("clk_timer3", "clk_timer0_root",
+                    CLK_SET_RATE_PARENT | CLK_NAME_IS_STATIC |
+                        CLK_PARENT_NAME_IS_STATIC,
+                    cru + RK3576_CRU_GATE_CON(17), 9,
+                    CLK_GATE_HIWORD_MASK | CLK_GATE_SET_TO_DISABLE);
+  clk_register_gate("clk_timer4", "clk_timer0_root",
+                    CLK_SET_RATE_PARENT | CLK_NAME_IS_STATIC |
+                        CLK_PARENT_NAME_IS_STATIC,
+                    cru + RK3576_CRU_GATE_CON(17), 10,
+                    CLK_GATE_HIWORD_MASK | CLK_GATE_SET_TO_DISABLE);
+  clk_register_gate("clk_timer5", "clk_timer0_root",
+                    CLK_SET_RATE_PARENT | CLK_NAME_IS_STATIC |
+                        CLK_PARENT_NAME_IS_STATIC,
+                    cru + RK3576_CRU_GATE_CON(17), 11,
+                    CLK_GATE_HIWORD_MASK | CLK_GATE_SET_TO_DISABLE);
+
+  /* TIMER_NS_1: root + CH0..CH5. */
+
+  RK3576_CLK_REGISTER_TIMER_ROOT_ONE(1, cru + RK3576_CRU_CLKSEL_CON(72), 6,
+                                     cru + RK3576_CRU_GATE_CON(18), 10);
+
+  clk_register_gate("clk_timer6", "clk_timer1_root",
+                    CLK_SET_RATE_PARENT | CLK_NAME_IS_STATIC |
+                        CLK_PARENT_NAME_IS_STATIC,
+                    cru + RK3576_CRU_GATE_CON(18), 11,
+                    CLK_GATE_HIWORD_MASK | CLK_GATE_SET_TO_DISABLE);
+
+  RK3576_CLK_REGISTER_TIMER_COMPOSITE_ONE(
+      7, cru + RK3576_CRU_CLKSEL_CON(72), 12, 2, 7,
+      cru + RK3576_CRU_GATE_CON(18), 12, g_timer7_sel_parents);
+
+  RK3576_CLK_REGISTER_TIMER_COMPOSITE_ONE(
+      8, cru + RK3576_CRU_CLKSEL_CON(73), 5, 2, 0,
+      cru + RK3576_CRU_GATE_CON(18), 13, g_timer8_sel_parents);
+
+  clk_register_gate("clk_timer9", "clk_timer1_root",
+                    CLK_SET_RATE_PARENT | CLK_NAME_IS_STATIC |
+                        CLK_PARENT_NAME_IS_STATIC,
+                    cru + RK3576_CRU_GATE_CON(18), 14,
+                    CLK_GATE_HIWORD_MASK | CLK_GATE_SET_TO_DISABLE);
+  clk_register_gate("clk_timer10", "clk_timer1_root",
+                    CLK_SET_RATE_PARENT | CLK_NAME_IS_STATIC |
+                        CLK_PARENT_NAME_IS_STATIC,
+                    cru + RK3576_CRU_GATE_CON(18), 15,
+                    CLK_GATE_HIWORD_MASK | CLK_GATE_SET_TO_DISABLE);
+  clk_register_gate("clk_timer11", "clk_timer1_root",
+                    CLK_SET_RATE_PARENT | CLK_NAME_IS_STATIC |
+                        CLK_PARENT_NAME_IS_STATIC,
+                    cru + RK3576_CRU_GATE_CON(19), 0,
+                    CLK_GATE_HIWORD_MASK | CLK_GATE_SET_TO_DISABLE);
+}
+#endif /* CONFIG_RK3576_TIMER */
+
+#undef RK3576_CLK_REGISTER_TIMER_ROOT_ONE
+#undef RK3576_CLK_REGISTER_TIMER_COMPOSITE_ONE
+
 /****************************************************************************
  * Public Functions
  ****************************************************************************/
@@ -2557,5 +2800,9 @@ void rk3576_clk_tree_initialize(void)
 
 #ifdef CONFIG_RK3576_FSPI
   rk3576_clk_register_fspi();
+#endif
+
+#ifdef CONFIG_RK3576_TIMER
+  rk3576_clk_register_timer();
 #endif
 }
