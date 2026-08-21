@@ -74,3 +74,7 @@ endif
 ifeq ($(CONFIG_RTC_ARCH),y)
 CHIP_CSRCS += rk3576_rtc.c
 endif
+
+ifeq ($(CONFIG_RK3576_TIMER),y)
+CHIP_CSRCS += rk3576_timer.c
+endif

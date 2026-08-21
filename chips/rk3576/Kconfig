@@ -186,6 +186,17 @@ config RK3576_FSPI
 		used to drive QSPI peripherals such as LCD displays, SPI NOR
 		flash, and SPI NAND flash.
 
+config RK3576_TIMER
+	bool "TIMER (generic programmable interval timer)"
+	default n
+	select TIMER
+	---help---
+		Enable the RK3576 TIMER driver (TRM Chapter 14).  Implements the
+		NuttX timer_lowerhalf_s so the upper-half can register /dev/timerN.
+		Each instance maps to one TIMER_NS_0 / TIMER_NS_1 channel
+		(6 channels each).  user-defined count-down mode with interrupt
+		on expiry.
+
 endmenu # Rockchip RK3576 Peripheral Selection
 
 config RK3576_OSC_FREQ

@@ -116,6 +116,17 @@
 #define RK3576_LITCORE_CRU_ADDR 0x27240000
 #define RK3576_CCI_CRU_ADDR     0x27248000
 
+/* Generic programmable interval timers (TRM).  Only the non-secure NS
+ * instances are exported; each block has 6 independent channels at a
+ * 0x1000 stride (see rk3576_timer.h).
+ */
+
+#define RK3576_TIMER_NS0_ADDR 0x2ACC0000
+#define RK3576_TIMER_NS1_ADDR 0x2ACD0000
+
+/* High precision timer */
+#define RK3576_HPTIMER_ADDR 0x27400000
+
 /* IOMUX */
 #define RK3576_IOC_ADDR 0x26040000
 
