@@ -20,6 +20,21 @@
 
 if(CONFIG_GRAPHICS_NYABULA_DISPLAY)
 
+  set(NYABULA_SRCS
+      main.c
+      nyabula_display.c
+      nyabula_dual_lcd.c
+      nyabula_blankgated_scheduler.c
+      nyabula_dual_demo.c)
+
+  if(CONFIG_NYABULA_DISPLAY_TE_SW)
+    list(APPEND NYABULA_SRCS nyabula_te_sw.c)
+  endif()
+
+  if(CONFIG_NYABULA_DISPLAY_TE_GPIO)
+    list(APPEND NYABULA_SRCS nyabula_te_gpio.c)
+  endif()
+
   nuttx_add_application(
     NAME
     nyabula_display
@@ -30,11 +45,7 @@ if(CONFIG_GRAPHICS_NYABULA_DISPLAY)
     MODULE
     ${CONFIG_GRAPHICS_NYABULA_DISPLAY}
     SRCS
-    main.c
-    nyabula_display.c
-    nyabula_dual_lcd.c
-    nyabula_v8_scheduler.c
-    nyabula_dual_demo.c)
+    ${NYABULA_SRCS})
 
   target_compile_definitions(
     apps

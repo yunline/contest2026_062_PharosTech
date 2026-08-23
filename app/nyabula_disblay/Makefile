@@ -28,7 +28,15 @@ STACKSIZE = $(CONFIG_NYABULA_DISPLAY_STACKSIZE)
 MODULE = $(CONFIG_GRAPHICS_NYABULA_DISPLAY)
 
 MAINSRC = main.c
-CSRCS = nyabula_display.c nyabula_dual_lcd.c nyabula_v8_scheduler.c nyabula_dual_demo.c
+CSRCS = nyabula_display.c nyabula_dual_lcd.c nyabula_blankgated_scheduler.c nyabula_dual_demo.c
+
+ifeq ($(CONFIG_NYABULA_DISPLAY_TE_SW),y)
+CSRCS += nyabula_te_sw.c
+endif
+
+ifeq ($(CONFIG_NYABULA_DISPLAY_TE_GPIO),y)
+CSRCS += nyabula_te_gpio.c
+endif
 
 CFLAGS += -DCONFIG_NYABULA_DISPLAY_BUFFER_SIZE=$(CONFIG_NYABULA_DISPLAY_BUFFER_SIZE)
 

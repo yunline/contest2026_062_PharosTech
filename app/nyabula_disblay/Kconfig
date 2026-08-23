@@ -51,6 +51,50 @@ config NYABULA_DISPLAY_SCREEN_HEIGHT
 	---help---
 		Height of each screen in pixels.
 
+choice NYABULA_DISPLAY_TE_SOURCE
+	prompt "TE (vertical sync) signal source"
+	default NYABULA_DISPLAY_TE_SW
+	---help---
+		Select where the TE edges (scan-start / blank-start) come from.
+		The algorithm and framework are source-agnostic (see
+		nyabula_te.h): they only consume the two edge callbacks.
+
+config NYABULA_DISPLAY_TE_SW
+	bool "Software frame clock (no TE pin wired)"
+	---help---
+		Temporary scheme while the panel TE pins are not routed: a
+		high-priority thread synthesizes the scan-start (TE falling) and
+		blank-start (TE rising) edges at the frame rate, with the two
+		screens staggered 90 degrees.
+
+config NYABULA_DISPLAY_TE_GPIO
+	bool "Panel TE GPIO interrupt (one pin per screen)"
+	depends on DEV_GPIO
+	---help---
+		Each screen's TE pin (HIGH=blanking, LOW=scanning) drives a GPIO
+		interrupt.  The GPIO driver signals the process (CONFIG_DEV_GPIO +
+		CONFIG_DEV_GPIO_NSIGNALS); a high-priority thread classifies the
+		edge by reading the pin level and calls the framework edge
+		callbacks.  Requires the board to register the TE pins as
+		interrupt GPIOs and the dev-path/signal Kconfig options below.
+endchoice
+
+if NYABULA_DISPLAY_TE_GPIO
+
+config NYABULA_DISPLAY_TE0_DEVPATH
+	string "TE GPIO device path for screen 0"
+	default "/dev/gpio0"
+	---help---
+		Path to the registered TE GPIO character device for screen 0.
+
+config NYABULA_DISPLAY_TE1_DEVPATH
+	string "TE GPIO device path for screen 1"
+	default "/dev/gpio1"
+	---help---
+		Path to the registered TE GPIO character device for screen 1.
+
+endif # NYABULA_DISPLAY_TE_GPIO
+
 config NYABULA_DISPLAY_AUDIT
 	bool "Enable dual-screen audit / profiling instrumentation"
 	default n

@@ -1,9 +1,9 @@
 /****************************************************************************
  * apps/graphics/nyabula_display/nyabula_dual_lcd.c
  *
- * Dual-screen dual-buffer LVGL interface layered on the v8 "BoundedChase"
- * frame scheduler (an in-house dual-panel scheduling algorithm; its C port
- * lives in nyabula_v8_scheduler.c).
+ * Dual-screen dual-buffer LVGL interface layered on the "BlankGated" frame
+ * scheduler (an in-house dual-panel scheduling algorithm; its C port lives
+ * in nyabula_blankgated_scheduler.c).
  *
  * Licensed to the Apache Software Foundation (ASF) under one or more
  * contributor license agreements.  See the NOTICE file distributed with
@@ -28,41 +28,45 @@
  * Two panels (ST77916, 360x360 RGB565) share ONE QSPI write bus, so at any
  * instant only one screen can be written.  This layer is the FRAMEWORK:
  * it owns the threads, the LVGL integration and the DMA (PUTAREA) device
- * access, and passes all *scheduling decisions* to the v8 algorithm
- * (nyabula_v8_scheduler.c).  Framework and algorithm are fully decoupled:
- * the algorithm only consumes the six callbacks/requests declared in
- * nyabula_v8_scheduler.h and knows nothing about LVGL or DMA.
+ * access, and passes all *scheduling decisions* to the BlankGated algorithm
+ * (nyabula_blankgated_scheduler.c).  Framework and algorithm are fully
+ * decoupled: the algorithm only consumes the four edge callbacks/requests
+ * declared in nyabula_blankgated_scheduler.h and knows nothing about LVGL
+ * or DMA.
  *
  * Thread model
  *   - Render loop    : logically a render thread, hosted by the caller
  *                   (main) via nyabula_dual_lcd_task(), which runs
  *                   lv_timer_handler() (LVGL is single-threaded).
- *   - TE thread       : software frame clock standing in for the real TE
- *                     signal.  Fires the scan edges at the frame rate and
- *                     feeds the ISR-safe edge handlers.  The two screens'
- *                     clocks are staggered 90-deg to de-correlate their QSPI
- *                     write bursts.  High priority for correct timing;
- *                     swap for a gpio ISR once hardware TE is wired.
- *   - Transfer thread: pops half-block write jobs and issues a BLOCKING
+ *   - TE source       : produces the scan-start / blank-start edges (see
+ *                     nyabula_te.h).  Today a software frame clock thread
+ *                     synthesizes them at the frame rate (screens staggered
+ *                     90-deg); when the panel TE pins are wired it becomes
+ *                     a GPIO interrupt source.  High priority for correct
+ *                     timing.
+ *   - Transfer thread: pops whole-frame write jobs and issues a BLOCKING
  *                     LCDDEVIO_PUTAREA ioctl (QSPI DMA).  It does not
  *                     consume CPU while the DMA is in flight.
  *
- * TE signal / state machine
- *   The panel TE is not yet wired in hardware, so a software frame clock
- *   synthesizes the two edges of the scan and forwards each to the v8
- *   algorithm via nyabula_v8_on_scan_half() (falling edge, front half
- *   scanned) and nyabula_v8_on_scan_start() (rising edge, full frame
- *   scanned).  All "which half, which generation, when" decisions live in
- *   the algorithm; the framework only executes the resulting write jobs on
- *   the DMA thread and reports block completion back to the algorithm.
+ * TE signal / polarity / state machine
+ *   The panel controller cannot produce a falling edge exactly at line 180
+ *   (what the previous v8 scheduler required): it only outputs a TE level,
+ *   HIGH during blanking and LOW during scanning.  The BlankGated algorithm
+ *   therefore gates a whole-frame QSPI write on *entering blanking* (TE
+ *   rising edge) and lets it cross into the active scan (catch-up scan),
+ *   since the write (7ms) is faster than the scan (7.5ms).
  *
- *   The edge entry points are kept ISR-safe: they only forward to v8 and
- *   post semaphores.  When the real TE signal is routed (gpio_irqattach),
- *   the same functions are called from an ISR with no change.
+ *   - scan-start edge (TE falling, blanking ends) -> on_scan_start
+ *   - blank-start edge (TE rising, blanking begins)-> on_blank_start
  *
- * Framework <-> algorithm interface (see nyabula_v8_scheduler.h):
- *   framework -> algorithm : on_scan_start / on_scan_half / on_render_done /
- *                            on_block_write_done
+ *   The edge callbacks (registered with the TE source) forward to the
+ *   algorithm (which takes its own lock).  A GPIO TE ISR must NOT call them
+ *   from interrupt context; the GPIO TE source defers to a thread (see
+ *   nyabula_te_gpio.c).
+ *
+ * Framework <-> algorithm interface (see nyabula_blankgated_scheduler.h):
+ *   framework -> algorithm : on_scan_start / on_blank_start / on_render_done
+ *                            / on_xfer_done
  *   algorithm -> framework : request_render / request_write / on_gen_complete
  ****************************************************************************/
 
@@ -95,23 +99,20 @@ static void rounder_cb(lv_event_t *e);
 static int create_thread_prio(pthread_t *thr, void *(*fn)(void *), void *arg,
                               int prio);
 
-/* TE edge forwarding to the v8 algorithm (ISR-safe). */
-static void te_edge_rise(nyabula_dual_lcd_t *dual, int sid);
-static void te_edge_fall(nyabula_dual_lcd_t *dual, int sid);
+/* TE edge callbacks (implemented by this framework, registered with the TE
+ * source via nyabula_te_init). */
+static void te_scan_start_cb(nyabula_dual_lcd_t *dual, int sid);
+static void te_blank_start_cb(nyabula_dual_lcd_t *dual, int sid);
 
-/* v8 request callbacks (algorithm -> framework). */
-static void v8_request_render(struct nyabula_screen *scr, int gen);
-static bool v8_request_write(struct nyabula_screen *scr, int start_line,
-                             int num_lines, int gen);
-static void v8_on_gen_complete(struct nyabula_screen *scr, int gen);
+/* BlankGated request callbacks (algorithm -> framework). */
+static void bg_request_render(struct nyabula_screen *scr, int gen);
+static bool bg_request_write(struct nyabula_screen *scr, int gen);
+static void bg_on_gen_complete(struct nyabula_screen *scr, int gen);
 
 /* Job queue (strict FIFO, bounded). */
 static int job_enqueue(nyabula_dual_lcd_t *dual, const nyabula_write_job_t *j);
 static int job_dequeue_fair(nyabula_dual_lcd_t *dual,
                             nyabula_write_job_t *out);
-
-/* TE software frame clock thread (stands in for the real TE ISR) */
-static void *te_thread_func(void *arg);
 
 /* Threads */
 static void *transfer_thread_func(void *arg);
@@ -187,7 +188,7 @@ static void rounder_cb(lv_event_t *e)
  *   would make it auto-render outside the TE cadence.  That built-in
  *   handler is registered first, so our callback runs AFTER it; here we
  *   pause the refresh timer again to cancel that auto-resume.  Rendering is
- *   thereby driven exclusively by the TE falling edge via explicit
+ *   thereby driven exclusively by the TE scan-start edge via explicit
  *   lv_refr_now() (the timer handle is kept non-NULL so lv_refr_now works).
  *
  *   Note: lv_refr_now() -> _lv_display_refr_timer() re-pauses the timer
@@ -252,11 +253,12 @@ static int buf_idx_of_gen(const nyabula_screen_t *scr, int gen)
 }
 
 /* algorithm -> framework: request render of a new generation for a screen.
- * Runs in the TE edge context (ISR-safe): only posts a render request for
- * the render loop to consume.  The actual lv_refr_now() happens later, on
- * the caller's thread in nyabula_dual_lcd_task(). */
+ * Runs under the algorithm lock (TE/transfer/render thread context): only
+ * posts a render request for the render loop to consume.  The actual
+ * lv_refr_now() happens later, on the caller's thread in
+ * nyabula_dual_lcd_task(). */
 
-static void v8_request_render(struct nyabula_screen *scr, int gen)
+static void bg_request_render(struct nyabula_screen *scr, int gen)
 {
   (void)gen; /* the algorithm already assigned gen; we just mark "render". */
 
@@ -274,23 +276,17 @@ static void v8_request_render(struct nyabula_screen *scr, int gen)
   sem_post(&scr->st_mutex);
 }
 
-/* algorithm -> framework: request a half-frame block write of `num_lines`
- * lines starting at `start_line`, carrying generation `gen`.  Runs in the
- * TE edge context; enqueues a job for the transfer thread (DMA).  Returns
- * true if the job was enqueued, false if the queue is full (block dropped). */
+/* algorithm -> framework: request a whole-frame write of generation `gen`.
+ * Runs under the algorithm lock; enqueues a job for the transfer thread
+ * (one blocking QSPI DMA for the entire frame).  Returns true if the job
+ * was enqueued, false if the queue is full (job dropped). */
 
-static bool v8_request_write(struct nyabula_screen *scr, int start_line,
-                             int num_lines, int gen)
+static bool bg_request_write(struct nyabula_screen *scr, int gen)
 {
   nyabula_dual_lcd_t *dual;
   nyabula_write_job_t job;
   int idx;
   int ret;
-
-  if (num_lines <= 0)
-    {
-      return false;
-    }
 
   dual = (nyabula_dual_lcd_t *)scr->dual;
   if (!dual || dual->quitting)
@@ -299,8 +295,8 @@ static bool v8_request_write(struct nyabula_screen *scr, int start_line,
     }
 
   /* Resolve the generation back to a concrete buffer.  The algorithm only
-   * ever writes generations that are already rendered (in _pending_gens),
-   * so this must succeed; if it does not, drop defensively. */
+   * ever writes generations that are already rendered (ready_gen), so this
+   * must succeed; if it does not, drop defensively. */
   sem_wait(&scr->st_mutex);
   idx = buf_idx_of_gen(scr, gen);
   if (idx < 0)
@@ -311,8 +307,6 @@ static bool v8_request_write(struct nyabula_screen *scr, int start_line,
 
   memset(&job, 0, sizeof(job));
   job.screen_id = scr->screen_id;
-  job.start_line = start_line;
-  job.num_lines = num_lines;
   job.buf_idx = idx;
   job.gen = gen;
 
@@ -322,11 +316,11 @@ static bool v8_request_write(struct nyabula_screen *scr, int start_line,
   return (ret == 0);
 }
 
-/* algorithm -> framework: a generation's two blocks are both fully written
- * to GRAM; its offscreen buffer is free for LVGL to reuse.  Post buf_free
- * so a blocked flush_wait_cb (or the render defer wait) can proceed. */
+/* algorithm -> framework: a generation's whole-frame write is fully done in
+ * GRAM; its offscreen buffer is free for LVGL to reuse.  Post buf_free so a
+ * blocked flush_wait_cb (or the render defer wait) can proceed. */
 
-static void v8_on_gen_complete(struct nyabula_screen *scr, int gen)
+static void bg_on_gen_complete(struct nyabula_screen *scr, int gen)
 {
   int idx;
 
@@ -347,17 +341,18 @@ static void v8_on_gen_complete(struct nyabula_screen *scr, int gen)
 }
 
 /****************************************************************************
- * Name: te_edge_rise
+ * Name: te_scan_start_cb
  *
  * Description:
- *   Rising edge of the scan (a full frame has been scanned).  Forwarded to
- *   the v8 algorithm, which decides whether to write the back half.
- *
- *   ISR-safe: only forwards state and posts semaphores.
+ *   TE edge callback (from the TE source): falling edge (HIGH -> LOW),
+ *   blanking ended, a new frame scan begins.  Forwarded to the algorithm,
+ *   which leaves the blanking window and asks for a new frame.  Also wakes
+ *   the render loop so the render request is consumed promptly at the frame
+ *   boundary.
  *
  ****************************************************************************/
 
-static void te_edge_rise(nyabula_dual_lcd_t *dual, int sid)
+static void te_scan_start_cb(nyabula_dual_lcd_t *dual, int sid)
 {
   nyabula_screen_t *scr;
 
@@ -372,27 +367,26 @@ static void te_edge_rise(nyabula_dual_lcd_t *dual, int sid)
       return;
     }
 
-  /* The edge handlers may already hold st_mutex via request callbacks that
-   * also take it; to avoid recursive deadlock the algorithm itself is not
-   * guarded by st_mutex here (its state is only touched from the single TE
-   * thread and the transfer thread's completion callback, see _on_block_*
-   * synchronization note).  Forward to v8. */
-  nyabula_v8_on_scan_start(&scr->v8, scr);
+  nyabula_bg_on_scan_start(&dual->bg, sid);
+
+  /* Wake the render loop once per frame so the pending render request
+   * (posted by bg_request_render via the algorithm) is consumed promptly at
+   * the frame boundary. */
+  sem_post(&dual->render_kick);
 }
 
 /****************************************************************************
- * Name: te_edge_fall
+ * Name: te_blank_start_cb
  *
  * Description:
- *   Falling edge of the scan: the panel has scanned rows 0..half-1.  Forwarded
- *   to the v8 algorithm, which locks the latest rendered generation, submits
- *   the front half and kicks the next frame render.
- *
- *   ISR-safe: only forwards state and posts semaphores.
+ *   TE edge callback (from the TE source): rising edge (LOW -> HIGH),
+ *   scanning finished, blanking begins.  This is the ONLY gate at which the
+ *   algorithm may start a whole-frame QSPI write (the write may then cross
+ *   into the active scan).
  *
  ****************************************************************************/
 
-static void te_edge_fall(nyabula_dual_lcd_t *dual, int sid)
+static void te_blank_start_cb(nyabula_dual_lcd_t *dual, int sid)
 {
   nyabula_screen_t *scr;
 
@@ -407,12 +401,7 @@ static void te_edge_fall(nyabula_dual_lcd_t *dual, int sid)
       return;
     }
 
-  nyabula_v8_on_scan_half(&scr->v8, scr);
-
-  /* Wake the render loop once per falling edge so the pending render
-   * request (posted by v8_request_render via the algorithm) is consumed
-   * promptly at the frame boundary. */
-  sem_post(&dual->render_kick);
+  nyabula_bg_on_blank_start(&dual->bg, sid);
 }
 
 /****************************************************************************
@@ -467,9 +456,10 @@ static int job_dequeue_fair(nyabula_dual_lcd_t *dual, nyabula_write_job_t *out)
  *
  * Description:
  *   Create a pthread with an explicit SCHED_FIFO priority (lower number =
- *   higher priority in NuttX).  Used to give the software TE frame clock a
- *   high priority so its edges fire on time and are not delayed by the
- *   render or transfer threads.
+ *   higher priority in NuttX).  Used for the transfer thread (which sits
+ *   below the TE source so TE edges win, but above the caller-hosted render
+ *   loop so the DMA keeps the bus busy).  The TE source threads are created
+ *   in the same way inside the TE module (nyabula_te_*.c).
  *
  ****************************************************************************/
 
@@ -502,126 +492,6 @@ static int create_thread_prio(pthread_t *thr, void *(*fn)(void *), void *arg,
 }
 
 /****************************************************************************
- * Name: te_ts_add_us
- *
- * Description:
- *   Advance a timespec by `us` microseconds in place (normalizing ns).
- *   Used by the absolute-time TE calibration to step the quarter-frame
- *   target clock without accumulating drift.
- *
- ****************************************************************************/
-
-static void te_ts_add_us(struct timespec *ts, useconds_t us)
-{
-  ts->tv_nsec += (long)us * 1000L;
-  while (ts->tv_nsec >= 1000000000L)
-    {
-      ts->tv_nsec -= 1000000000L;
-      ts->tv_sec++;
-    }
-}
-
-/****************************************************************************
- * Name: te_thread_func
- *
- * Description:
- *   Software TE frame clock.  Until the real TE signal is routed from the
- *   panels, this thread synthesizes the scan edges at the target frame
- *   rate and feeds them to the ISR-safe edge handlers -- the same entry
- *   points a future gpio_irqattach ISR would call.  Keeping it on its own
- *   thread mirrors the asynchronous nature of a hardware TE interrupt.
-
- *   The frame period is divided into 4 quarter-frame ticks (90-deg each).
- *   Each screen carries its own phase offset (te_phase_shift); screen 1 is
- *   offset by 1 tick (90-deg) so its fall/rise edges do not coincide with
- *   screen 0's.  This staggers the two screens' write submissions, giving
- *   a milder load profile on the shared QSPI bus.
- *
- *   Per screen, per frame:
- *     phase 0 : falling edge (front half scanned out) -> submit front half
- *     phase 2 : rising  edge (full frame scanned)     -> submit back half
- *
- ****************************************************************************/
-
-static void *te_thread_func(void *arg)
-{
-  nyabula_dual_lcd_t *dual = (nyabula_dual_lcd_t *)arg;
-  useconds_t period_us;
-  useconds_t quarter_us;
-  struct timespec next_ts;
-  uint8_t tick;
-  int sid;
-
-  period_us = 1000000 / NYABULA_DUAL_LCD_REFRESH_HZ;
-  quarter_us = period_us / 4;
-  tick = 0;
-
-  /* Initialize the absolute quarter-frame target clock, one quarter ahead so
-   * the first TE edge fires ~quarter_us into the run.  From here on we sleep
-   * to ABSOLUTE target times (TIMER_ABSTIME), accumulating the step onto a
-   * fixed baseline each quarter.  usleep()'s unpredictable per-sleep overhead
-   * then shows up only as a non-cumulative per-quarter residual instead of
-   * 4x amplified into the frame period. */
-  clock_gettime(CLOCK_MONOTONIC, &next_ts);
-  te_ts_add_us(&next_ts, quarter_us);
-
-  while (dual->running)
-    {
-      for (sid = 0; sid < NYABULA_DUAL_LCD_MAX_SCREENS; sid++)
-        {
-          /* phase only needs the low 2 bits: tick is kept in 0..3 so the
-           * counter never grows beyond 4 (no long-run overflow). */
-          int phase = (int)((tick + dual->screen[sid].te_phase_shift) & 3u);
-
-          if (phase == 0)
-            {
-              /* Falling edge: front half of this screen's frame scanned. */
-              te_edge_fall(dual, sid);
-            }
-          else if (phase == 2)
-            {
-              /* Rising edge: full frame scanned -> back half, same gen. */
-              te_edge_rise(dual, sid);
-            }
-        }
-
-      /* Sleep to the CURRENT absolute target, then advance the target by one
-       * quarter onto the IDEAL clock line -- do NOT re-anchor to the actual
-       * wake-up moment.  If we re-anchored on the real wake time, every
-       * late-wake delta (scheduling delay, higher-prio interrupt, other load)
-       * would be baked into the next period permanently, and the long-run
-       * frame period would settle at (quarter + ~1ms) instead of period_us
-       * (measured: target 50Hz landed at 41.67Hz / 24ms).  Keeping the
-       * absolute target accumulating on the ideal line means a late wake
-       * shortens only the NEXT sleep (it is caught up), so single-frame
-       * jitter does not accumulate and the long-run period stays exactly
-       * period_us.
-       *
-       * quarter_us = period_us/4 truncates (60Hz -> 16666/4 = 4166us, i.e.
-       * 4*4166 = 16664 != 16666).  To hold the full frame at exactly
-       * period_us we add the truncation remainder (period_us - 3*quarter_us)
-       * on the final quarter (tick==3) and quarter_us on the other three, so
-       * one frame = (p-3q) + q + q + q = p (0 truncation drift). */
-      clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next_ts, NULL);
-
-      if (tick == 3)
-        {
-          /* Closing the frame: use the exact per-frame remainder so the
-           * four quarters sum to period_us (0 truncation drift). */
-          te_ts_add_us(&next_ts, period_us - 3 * quarter_us);
-        }
-      else
-        {
-          te_ts_add_us(&next_ts, quarter_us);
-        }
-
-      tick = (uint8_t)((tick + 1) & 3u);
-    }
-
-  return NULL;
-}
-
-/****************************************************************************
  * Name: nyabula_dual_lcd_task
  *
  * Description:
@@ -630,7 +500,7 @@ static void *te_thread_func(void *arg)
  *     1) advances LVGL via lv_timer_handler() (timers, animation, refresh),
  *     2) consumes any pending TE-driven render requests: invalidates the
  *        screen's active object once so LVGL renders exactly one full frame
- *        (FULL mode) to feed the v8 pipeline.
+ *        (FULL mode) to feed the BlankGated pipeline.
  *
  *   The display layer starts the TE/transfer threads in create(); the
  *   caller hosts the lv_timer_handler() call (LVGL is single-threaded, and
@@ -639,7 +509,7 @@ static void *te_thread_func(void *arg)
  *
  *   Animation is unaffected: LVGL's animation timer and the default
  *   refresh re-arm path are untouched; we only add one extra full-screen
- *   invalidate per TE falling edge.
+ *   invalidate per TE scan-start edge.
  *
  *   Blocks up to the LVGL idle period when idle (wakes early on a render
  *   kick), then returns so the caller can drive the loop.
@@ -661,14 +531,14 @@ void nyabula_dual_lcd_task(nyabula_dual_lcd_t *dual)
    * advances animations (time from the NuttX clock via lv_tick_set_cb) and
    * accumulates their invalidations; the default refresh timer is kept
    * paused (see te_refr_req_cb), so it does NOT itself render.  The render
-   * happens below via lv_refr_now() driven by the v8 algorithm's render
+   * happens below via lv_refr_now() driven by the algorithm's render
    * request, keeping the pipeline TE-aligned. */
   idle = lv_timer_handler();
 
-  /* Consume TE/v8-driven render requests: for each screen whose algorithm
+  /* Consume TE-driven render requests: for each screen whose algorithm
    * requested a frame, issue lv_refr_now().  lv_refr_now() advances
    * animations too and skips drawing when there is no invalid area.  The
-   * double-buffer gating is entirely the algorithm's job (v8 _can_render):
+   * double-buffer gating is entirely the algorithm's job (can_render):
    * it only requests a render when a working buffer is available, so the
    * render loop never has to decide deferral here. */
   for (sid = 0; sid < NYABULA_DUAL_LCD_MAX_SCREENS; sid++)
@@ -696,11 +566,11 @@ void nyabula_dual_lcd_task(nyabula_dual_lcd_t *dual)
         }
     }
 
-  /* Wait for either a TE edge kick (posted by the TE thread so we service
-   * lv_timer_handler() promptly at the frame boundary) or until the LVGL
-   * idle period elapses -- whichever comes first.  The timeout is computed
-   * relative to NOW so the wait never extends beyond `idle` ms from this
-   * moment, keeping the LVGL clock true. */
+  /* Wait for either a TE edge kick (posted by the TE scan-start callback so
+   * we service lv_timer_handler() promptly at the frame boundary) or until
+   * the LVGL idle period elapses -- whichever comes first.  The timeout is
+   * computed relative to NOW so the wait never extends beyond `idle` ms from
+   * this moment, keeping the LVGL clock true. */
   if (idle == 0)
     {
       idle = 1;
@@ -721,15 +591,16 @@ void nyabula_dual_lcd_task(nyabula_dual_lcd_t *dual)
  * Name: transfer_thread_func
  *
  * Description:
- *   Transfer thread.  Pops half-block write jobs (front or back) from the
- *   job queue and issues a BLOCKING LCDDEVIO_PUTAREA ioctl (QSPI DMA) for
- *   each -- the call blocks until the DMA completes but does not consume
- *   CPU meanwhile.  Fair dispatch alternates between the two screens so
- *   neither can monopolize the shared bus.
+ *   Transfer thread.  Pops whole-frame write jobs from the job queue and
+ *   issues a BLOCKING LCDDEVIO_PUTAREA ioctl (QSPI DMA) for each -- the
+ *   call blocks until the DMA completes but does not consume CPU meanwhile.
+ *   The shared bus serves jobs strictly in submission order (FIFO); fairness
+ *   between screens is the ALGORITHM's job at submission time, not the
+ *   framework's.
  *
- *   After each block completes, the edge is reported to the v8 algorithm
- *   (nyabula_v8_on_block_write_done), which decrements its in-flight count
- *   and self-determines generation completion (freeing the double buffer).
+ *   After each whole-frame write completes, the edge is reported to the
+ *   BlankGated algorithm (nyabula_bg_on_xfer_done), which releases the
+ *   single-flight bus and frees the generation's double buffer.
  *
  ****************************************************************************/
 
@@ -754,13 +625,15 @@ static void *transfer_thread_func(void *arg)
 
       scr = &dual->screen[job.screen_id];
 
-      lcd_area.row_start = job.start_line;
-      lcd_area.row_end = job.start_line + job.num_lines - 1;
+      /* Whole frame: rows 0..total_lines-1, write pointer runs in the same
+       * direction as the panel scan (top of GRAM first), which is what the
+       * catch-up-scan guarantee requires. */
+      lcd_area.row_start = 0;
+      lcd_area.row_end = scr->total_lines - 1;
       lcd_area.col_start = 0;
       lcd_area.col_end = scr->width - 1;
       lcd_area.stride = scr->stride;
-      lcd_area.data =
-          scr->buf[job.buf_idx].data + (int64_t)job.start_line * scr->stride;
+      lcd_area.data = scr->buf[job.buf_idx].data;
 
       ret = ioctl(scr->fd, LCDDEVIO_PUTAREA, (unsigned long)&lcd_area);
       if (ret < 0)
@@ -770,12 +643,13 @@ static void *transfer_thread_func(void *arg)
                   lcd_area.row_start, lcd_area.row_end, -ret);
         }
 
-      /* Block transfer complete: report the edge to the v8 algorithm, which
-       * decrements its in-flight count and self-determines whether the whole
-       * generation is now written (releasing the double buffer).  The DMA
-       * hardware gives us exactly one interrupt per submitted block, which
-       * is the physical signal v8 keys its bookkeeping on. */
-      nyabula_v8_on_block_write_done(&scr->v8, job.gen);
+      /* Whole-frame transfer complete: report the edge to the BlankGated
+       * algorithm, which releases the single-flight bus and (because a
+       * generation is complete exactly when its single whole-frame write
+       * ends) frees the double buffer.  The DMA hardware gives us exactly
+       * one interrupt per submitted write, which is the physical signal the
+       * algorithm keys its bookkeeping on. */
+      nyabula_bg_on_xfer_done(&dual->bg, job.screen_id, job.gen);
     }
 
   return NULL;
@@ -794,10 +668,10 @@ static void *transfer_thread_func(void *arg)
  *   a new draw would overwrite content whose DMA transfer has not finished.
  *   Once at least one buffer is free, return immediately.
  *
- *   The v8 algorithm already guarantees it only requests a render when a
- *   working buffer is available (_can_render), so under a healthy bus this
- *   rarely blocks; it is a defensive net for LVGL's internal buffer
- *   alternation racing a slow back-half DMA.
+ *   The BlankGated algorithm already guarantees it only requests a render
+ *   when a working buffer is available (can_render), so under a healthy bus
+ *   this rarely blocks; it is a defensive net for LVGL's internal buffer
+ *   alternation racing a slow whole-frame DMA.
  *
  ****************************************************************************/
 
@@ -833,9 +707,9 @@ static void flush_wait_cb(lv_display_t *disp)
  * Description:
  *   LVGL flush callback, called from the render thread when LVGL finishes
  *   rendering a full frame into one of the two buffers.  Binds the
- *   generation (assigned by the v8 algorithm via request_render, stored in
+ *   generation (assigned by the algorithm via request_render, stored in
  *   scr->render_gen) to the physical buffer LVGL chose, then reports
- *   on_render_done so the algorithm moves the generation into its pending
+ *   on_render_done so the algorithm moves the generation into its ready
  *   (awaiting-write) set.
  *
  *   A full double-buffer wait is handled by flush_wait_cb() above in LVGL's
@@ -858,7 +732,7 @@ static void flush_cb(lv_display_t *disp, const lv_area_t *area,
   sem_wait(&scr->st_mutex);
 
   /* The generation LVGL was asked to draw (request_render) is now realized
-   * in this physical buffer.  Bind it and report completion to the v8
+   * in this physical buffer.  Bind it and report completion to the
    * algorithm. */
   gen = scr->render_gen;
   done_gen = -1;
@@ -874,9 +748,9 @@ static void flush_cb(lv_display_t *disp, const lv_area_t *area,
   if (done_gen != -1)
     {
       /* Content is ready: the algorithm moves done_gen from "rendering" to
-       * "pending write".  Called outside st_mutex (the algorithm's own
-       * state is not shared with the framework's st_mutex). */
-      nyabula_v8_on_render_done(&scr->v8, done_gen);
+       * "ready".  Called outside st_mutex (the algorithm takes its own lock).
+       */
+      nyabula_bg_on_render_done(&scr->dual->bg, scr->screen_id, done_gen);
     }
 
   /* Release this buffer so LVGL resumes rendering into the other one. */
@@ -1000,9 +874,9 @@ static int screen_display_on(nyabula_screen_t *scr)
  *
  * Description:
  *   Initialize a single screen: open the LCD device, allocate two full-frame
- *   RGB565 buffers, set up the LVGL display.  The v8 algorithm context is
- *   initialized (with callbacks) by the caller after the dual context is
- *   built, since it needs the dual back-pointer.
+ *   RGB565 buffers, set up the LVGL display.  The BlankGated algorithm
+ *   context is initialized (with callbacks) by the caller after the dual
+ *   context is built, since it needs the dual back-pointer.
  *
  ****************************************************************************/
 
@@ -1016,7 +890,6 @@ static int screen_init(nyabula_screen_t *scr, int sid, const char *dev_path,
   scr->height = height;
   scr->stride = width * 2; /* RGB565: 2 bytes per pixel */
   scr->total_lines = height;
-  scr->half_lines = height / 2;
   scr->buf_size = (uint32_t)width * height * 2;
   scr->render_gen = -1;
   scr->render_request = false;
@@ -1079,7 +952,7 @@ static int screen_init(nyabula_screen_t *scr, int sid, const char *dev_path,
     }
 
   /* LVGL renders one full frame per buffer and calls flush_cb once for the
-   * whole screen; this matches the v8 whole-half-block model. */
+   * whole screen; this matches the BlankGated whole-frame write model. */
   lv_display_set_buffers(scr->disp, scr->buf[0].data, scr->buf[1].data,
                          scr->buf_size, LV_DISPLAY_RENDER_MODE_FULL);
   lv_display_set_flush_cb(scr->disp, flush_cb);
@@ -1091,7 +964,7 @@ static int screen_init(nyabula_screen_t *scr, int sid, const char *dev_path,
    * `if(disp->refr_timer)`).  But we neutralize its auto-running via
    * te_refr_req_cb(), which pauses it on every REFR_REQUEST (after LVGL's
    * built-in handler has resumed it), so rendering is driven exclusively
-   * by the TE falling edge through explicit lv_refr_now(). */
+   * by the TE scan-start edge through explicit lv_refr_now(). */
   lv_display_add_event_cb(scr->disp, rounder_cb, LV_EVENT_INVALIDATE_AREA,
                           scr);
   lv_display_add_event_cb(scr->disp, te_refr_req_cb, LV_EVENT_REFR_REQUEST,
@@ -1199,8 +1072,8 @@ static void screen_destroy(nyabula_screen_t *scr)
  *
  * Description:
  *   Create the dual-LCD context with the two threads (software TE frame
- *   clock + transfer) and wire the v8 scheduling algorithm by registering
- *   its request callbacks.
+ *   clock + transfer) and wire the BlankGated scheduling algorithm by
+ *   registering its request callbacks.
  *
  ****************************************************************************/
 
@@ -1209,7 +1082,7 @@ nyabula_dual_lcd_t *nyabula_dual_lcd_create(const char *dev_path0,
                                             int height)
 {
   nyabula_dual_lcd_t *dual;
-  nyabula_v8_callbacks_t v8_cb;
+  nyabula_bg_callbacks_t bg_cb;
   int sid;
   int ret;
 
@@ -1234,6 +1107,7 @@ nyabula_dual_lcd_t *nyabula_dual_lcd_create(const char *dev_path0,
     }
 
   dual->running = false;
+  dual->te = NULL;
   dual->job_head = 0;
   dual->job_tail = 0;
   dual->job_count = 0;
@@ -1259,42 +1133,43 @@ nyabula_dual_lcd_t *nyabula_dual_lcd_create(const char *dev_path0,
       goto err_screen1;
     }
 
-  /* Wire the v8 algorithm for both screens: register its request callbacks
-   * and set the dual back-pointer so the algorithm's write request can reach
-   * the job queue.  The algorithm only ever sees the opaque screen handle
-   * and these callbacks -- no LVGL/DMA detail. */
-  v8_cb.request_render = v8_request_render;
-  v8_cb.request_write = v8_request_write;
-  v8_cb.on_gen_complete = v8_on_gen_complete;
+  /* Wire the BlankGated algorithm: register its request callbacks and set
+   * the screen back-pointers so its write request can reach the job queue.
+   * The algorithm only ever sees the opaque screen handles and these
+   * callbacks -- no LVGL/DMA detail. */
+  bg_cb.request_render = bg_request_render;
+  bg_cb.request_write = bg_request_write;
+  bg_cb.on_gen_complete = bg_on_gen_complete;
+
+  nyabula_bg_init(&dual->bg, &bg_cb);
 
   for (sid = 0; sid < NYABULA_DUAL_LCD_MAX_SCREENS; sid++)
     {
       dual->screen[sid].dual = dual;
-      nyabula_v8_init(&dual->screen[sid].v8, dual->screen[sid].half_lines,
-                      dual->screen[sid].total_lines, &v8_cb);
-      dual->screen[sid].v8.screen = &dual->screen[sid];
+      dual->bg.screen[sid] = &dual->screen[sid];
     }
-
-  /* TE clock phase (0 = no stagger): screen 1 leads screen 0 by 0-deg so
-   * both screens' scan edges coincide.  This is the harshest operating point
-   * for the shared QSPI bus (both screens submit writes at the same instant).
-   * Originally 1 (90-deg stagger); set to 0 to stress the scheduler. */
-  dual->screen[1].te_phase_shift = 1;
 
   dual->running = true;
 
-  /* Start the software TE frame clock thread (placeholder for TE ISR), at
-   * high priority so edges fire on time regardless of render/transfer load. */
-  ret = create_thread_prio(&dual->te_thread, te_thread_func, dual,
-                           NYABULA_DUAL_LCD_TE_PRIORITY);
-  if (ret != 0)
+  /* Start the TE edge source (software frame clock now, panel TE GPIO
+   * interrupt later; selected by CONFIG_NYABULA_DISPLAY_TE_SOURCE).  It
+   * calls te_scan_start_cb / te_blank_start_cb on the edges. */
+  {
+    nyabula_te_callbacks_t te_cb;
+
+    te_cb.scan_start = te_scan_start_cb;
+    te_cb.blank_start = te_blank_start_cb;
+    dual->te = nyabula_te_init(dual, &te_cb);
+  }
+
+  if (dual->te == NULL)
     {
-      LV_LOG_ERROR("Failed to create TE thread: %d", ret);
+      LV_LOG_ERROR("Failed to start TE source");
       dual->running = false;
       goto err_te_thread;
     }
 
-  /* Start the transfer (QSPI DMA) thread at a priority below the TE thread
+  /* Start the transfer (QSPI DMA) thread at a priority below the TE source
    * (so TE wins) but above the render/main thread (so DMA keeps busy). */
   ret = create_thread_prio(&dual->transfer_thread, transfer_thread_func, dual,
                            NYABULA_DUAL_LCD_TRANSFER_PRIORITY);
@@ -1302,11 +1177,12 @@ nyabula_dual_lcd_t *nyabula_dual_lcd_create(const char *dev_path0,
     {
       LV_LOG_ERROR("Failed to create transfer thread: %d", ret);
       dual->running = false;
-      pthread_join(dual->te_thread, NULL);
-      goto err_te_thread; /* te thread already joined; fall into cleanup */
+      nyabula_te_deinit(dual->te);
+      dual->te = NULL;
+      goto err_te_thread;
     }
 
-  LV_LOG_USER("Dual LCD created successfully (v8 bounded chase, %d fps); "
+  LV_LOG_USER("Dual LCD created successfully (BlankGated scheduler, %d fps); "
               "run nyabula_dual_lcd_task() in a loop to drive rendering",
               NYABULA_DUAL_LCD_REFRESH_HZ);
   return dual;
@@ -1347,13 +1223,15 @@ void nyabula_dual_lcd_destroy(nyabula_dual_lcd_t *dual)
   /* Stop the threads. */
   dual->running = false;
 
-  /* Wake the TE thread (sleeping between edges -> it checks running on the
-   * next usleep boundary) and the transfer thread (blocked on job_avail).
-   * The render loop is hosted by the caller, not joined here. */
+  /* Wake the transfer thread (blocked on job_avail).  The render loop is
+   * hosted by the caller, not joined here. */
   sem_post(&dual->render_kick);
   sem_post(&dual->job_avail);
 
-  pthread_join(dual->te_thread, NULL);
+  /* Stop the TE edge source (its thread exits on running=false). */
+  nyabula_te_deinit(dual->te);
+  dual->te = NULL;
+
   pthread_join(dual->transfer_thread, NULL);
 
   screen_destroy(&dual->screen[0]);

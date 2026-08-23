@@ -30,9 +30,13 @@
 #include <pthread.h>
 #include <semaphore.h>
 
-/* v8 algorithm layer: framework and scheduler are decoupled; the algorithm
- * issues render/write requests via the registered callbacks. */
-#include "nyabula_v8_scheduler.h"
+/* BlankGated algorithm layer: framework and scheduler are decoupled; the
+ * algorithm issues render/write requests via the registered callbacks. */
+#include "nyabula_blankgated_scheduler.h"
+
+/* TE edge source abstraction (software frame clock now, panel TE GPIO
+ * interrupt later; selected by CONFIG_NYABULA_DISPLAY_TE_SOURCE). */
+#include "nyabula_te.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -56,30 +60,25 @@ extern "C" {
 #define NYABULA_DUAL_LCD_DEF_HEIGHT 360
 #endif
 
-/* Default refresh rate in Hz driving the software TE signal. */
+/* Default refresh rate in Hz.  The TE source (see nyabula_te.h) derives the
+ * software frame clock from this when the SW source is selected. */
 
 #ifndef NYABULA_DUAL_LCD_REFRESH_HZ
 #define NYABULA_DUAL_LCD_REFRESH_HZ 60
 #endif
 
-/* Thread priorities (NuttX: lower number = higher priority).
- *
- * TE (software frame clock, stands in for the future TE GPIO ISR) must be the
- * HIGHEST so its edges fire on time and are not delayed by render/transfer.
- * Transfer (blocking PUTAREA DMA) sits below TE but above the caller-hosted
- * render loop so the DMA keeps the bus busy. */
-
-#ifndef NYABULA_DUAL_LCD_TE_PRIORITY
-#define NYABULA_DUAL_LCD_TE_PRIORITY 95
-#endif
+/* Transfer thread priority (NuttX: lower number = higher priority).  The
+ * transfer (blocking PUTAREA DMA) sits below the TE source but above the
+ * caller-hosted render loop so the DMA keeps the bus busy.  The TE priority
+ * lives in nyabula_te.h (NYABULA_TE_PRIORITY). */
 
 #ifndef NYABULA_DUAL_LCD_TRANSFER_PRIORITY
 #define NYABULA_DUAL_LCD_TRANSFER_PRIORITY 98
 #endif
 
-/* Size of the transfer job queue (half-block jobs).  Entry of a job is gated
- * by the v8 backpressure budget, so this only needs a couple of half-blocks
- * per screen plus margin. */
+/* Size of the transfer job queue (whole-frame jobs).  The algorithm only
+ * issues one write at a time (single-flight shared bus), so this only needs
+ * a couple of slots plus margin. */
 
 #define NYABULA_JOB_QUEUE_SIZE 8
 
@@ -103,12 +102,13 @@ typedef struct
 
 struct nyabula_dual_lcd_s;
 
-/* Per-screen state and LVGL handle.  The v8 scheduling state lives in the
- * embedded nyabula_v8_t (see nyabula_v8_scheduler.h); this struct holds only
- * the framework-side resources (device, LVGL display, buffers, sync).
+/* Per-screen state and LVGL handle.  The scheduling state lives in the
+ * shared nyabula_bg_t in the dual context (see
+ * nyabula_blankgated_scheduler.h); this struct holds only the framework-side
+ * resources (device, LVGL display, buffers, sync).
  *
  * The tag "nyabula_screen" matches the opaque forward-declaration used by
- * the v8 algorithm header, so the algorithm can reference screens purely by
+ * the algorithm header, so the algorithm can reference screens purely by
  * pointer without knowing their layout. */
 
 struct nyabula_screen
@@ -123,16 +123,11 @@ struct nyabula_screen
   int stride;        /* Bytes per scan line (RGB565 => width*2) */
   uint32_t buf_size; /* Bytes per full frame buffer */
   int total_lines;   /* height */
-  int half_lines;    /* total_lines / 2 */
 
   struct lcddev_area_align_s align;
 
   /* Double buffers (full screen each) */
   nyabula_buf_t buf[2];
-
-  /* v8 scheduling algorithm context (framework/algorithm decoupled: the
-   * algorithm owns its state only through this struct). */
-  nyabula_v8_t v8;
 
   /* Generation currently being rendered by LVGL (assigned by the algorithm
    * via request_render; flush_cb binds this generation to the physical
@@ -140,12 +135,12 @@ struct nyabula_screen
   int render_gen;
 
   /* Posted by the transfer thread whenever a buffer generation becomes
-   * fully written (back half DMA done) and is therefore free for LVGL to
+   * fully written (whole-frame DMA done) and is therefore free for LVGL to
    * reuse.  The render thread's flush_wait_cb waits here while a target
    * buffer is still locked. */
   sem_t buf_free;
 
-  /* TE-driven render request.  The TE falling edge (via the v8 algorithm)
+  /* TE-driven render request.  The TE scan-start edge (via the algorithm)
    * requests a render; the render loop consumes this flag to issue exactly
    * one lv_refr_now() for this screen at the frame boundary.  Guarded by
    * st_mutex. */
@@ -158,18 +153,11 @@ struct nyabula_screen
    * and (upcoming) interrupt context. */
   sem_t st_mutex;
 
-  /* Software TE phase offset, in quarter-frame ticks (0..3).  Screen 0
-   * uses 0; screen 1 uses 1 so its scan edges are shifted 90-deg (1/4 frame
-   * period) relative to screen 0.  This staggers the two screens' write
-   * requests so the shared QSPI bus is not hit by both screens at exactly
-   * the same instant. */
-  uint8_t te_phase_shift;
-
   /* Screen index (0 or 1), set at create time. */
   int screen_id;
 
   /* Back-pointer to the owning dual context (set at create time), used by
-   * the v8 request callbacks to reach the job queue / threads. */
+   * the request callbacks to reach the job queue / threads. */
   struct nyabula_dual_lcd_s *dual;
 
   bool initialized;
@@ -177,15 +165,14 @@ struct nyabula_screen
 
 typedef struct nyabula_screen nyabula_screen_t;
 
-/* A pending write block queued for the transfer thread: a half-frame
- * (front or back). */
+/* A pending whole-frame write queued for the transfer thread.  The BlankGated
+ * scheduler writes the ENTIRE frame (all total_lines rows, from row 0) in one
+ * blocking QSPI DMA per generation, gated on the target screen's blanking. */
 typedef struct
 {
-  int screen_id;  /* 0 or 1 */
-  int start_line; /* Row offset within GRAM (0 for front, half for back) */
-  int num_lines;  /* half_lines for both front & back */
-  int buf_idx;    /* Offscreen buffer holding the content */
-  int gen;        /* Content generation */
+  int screen_id; /* 0 or 1 */
+  int buf_idx;   /* Offscreen buffer holding the content */
+  int gen;       /* Content generation */
 } nyabula_write_job_t;
 
 /* Dual screen context.  The tag is exposed so the audit interface (in
@@ -195,17 +182,18 @@ typedef struct nyabula_dual_lcd_s
 {
   nyabula_screen_t screen[NYABULA_DUAL_LCD_MAX_SCREENS];
 
-  /* Transfer thread: blocking QSPI DMA, one half-block at a time, fairly
-   * alternating between the two screens. */
+  /* BlankGated scheduling algorithm context (shared by both screens so the
+   * single shared-bus write is arbitrated here). */
+  nyabula_bg_t bg;
+
+  /* Transfer thread: blocking QSPI DMA, one whole-frame at a time. */
   pthread_t transfer_thread;
 
-  /* Software TE frame clock.  A dedicated thread (standing in for the real
-   * TE signal, which is not yet wired in hardware) fires the scan-start
-   * (rising) and scan-half (falling) edges at the frame rate by calling
-   * the ISR-safe edge handlers -- exactly how a future gpio TE ISR would.
-   * It is kept OFF the render thread so the render thread may safely block
-   * while waiting for a transfer-competed buffer. */
-  pthread_t te_thread;
+  /* TE edge source (software frame clock or panel TE GPIO interrupt, see
+   * nyabula_te.h).  It calls the edge callbacks on scan-start/blank-start;
+   * the framework only forwards them to the algorithm.  Allocated by
+   * nyabula_te_init(), released by nyabula_te_deinit(). */
+  nyabula_te_t *te;
   bool running;
 
   /* Write-job queue consumed by the transfer thread (bounded, strict FIFO). */
