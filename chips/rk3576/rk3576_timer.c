@@ -93,7 +93,14 @@
   (((uint64_t)(us) * ((freq) / 1000000ULL)) + \
    (((uint64_t)(us) * ((freq) % 1000000ULL)) / 1000000ULL))
 
-#define TIMER_TICKS_TO_USEC(freq, t) ((uint32_t)((t) / ((freq) / 1000000ULL)))
+/* ticks -> us.  Defensive form: guard against freq < 1 MHz (freq/1e6 == 0
+ * would divide by zero) by using a single 64-bit multiply-then-divide.
+ * With t bounded by UINT32_MAX us * freq the product stays well inside
+ * uint64_t for every real RK3576 timer rate.
+ */
+
+#define TIMER_TICKS_TO_USEC(freq, t) \
+  ((uint32_t)(((uint64_t)(t)*1000000ULL) / ((freq) ? (freq) : 1ULL)))
 
 /****************************************************************************
  * Private Types
@@ -110,6 +117,7 @@ struct rk3576_timer_s
   int irq;                           /* GIC INTID for this channel           */
   bool started;                      /* Counter currently running            */
   uint32_t timeout;                  /* Current timeout in microseconds      */
+  uint32_t gen;                      /* Bumped by START/STOP/SETTIMEOUT      */
   tccb_t callback;                   /* Upper-half expiry callback           */
   FAR void *arg;                     /* Callback argument                    */
   FAR struct clk_s *clk;             /* Channel counting clock (clk_timerN)  */
@@ -230,6 +238,7 @@ static int rk3576_timer_interrupt(int irq, FAR void *context, FAR void *arg)
   irqstate_t flags;
   tccb_t callback;
   FAR void *cbarg;
+  uint32_t gen;
   uint32_t next_interval = 0;
 
   /* The ISR races with user ioctl (TCIOC_START/STOP/SETTIMEOUT), which the
@@ -245,12 +254,17 @@ static int rk3576_timer_interrupt(int irq, FAR void *context, FAR void *arg)
 
   rk3576_timer_putreg(priv, RK3576_TIMER_INTSTATUS, TIMER_INTSTATUS_PD);
 
-  /* Snapshot callback/arg under the lock so the user callback runs without
-   * holding the spinlock (it must stay free to call back into this driver).
+  /* Snapshot callback/arg and the state-generation counter under the lock
+   * so the user callback runs without holding the spinlock (it must stay
+   * free to call back into this driver).  Any ioctl that changes the
+   * running state (START/STOP/SETTIMEOUT) bumps priv->gen, so comparing it
+   * after the callback detects whether the state changed while the lock
+   * was dropped.
    */
 
   callback = priv->callback;
   cbarg = priv->arg;
+  gen = priv->gen;
 
   if (callback != NULL)
     {
@@ -259,21 +273,44 @@ static int rk3576_timer_interrupt(int irq, FAR void *context, FAR void *arg)
       if (callback(&next_interval, cbarg))
         {
           /* Periodic: reload with the (possibly updated) interval and
-           * restart the down-counter.
+           * restart the down-counter.  Re-arm only if no ioctl changed the
+           * running state while the callback ran with the lock dropped;
+           * otherwise a TCIOC_STOP issued during the callback would be
+           * silently undone.
            */
 
           flags = spin_lock_irqsave(&priv->lock);
-          if (next_interval > 0)
+          if (priv->gen == gen)
             {
-              rk3576_timer_settimeout_locked(priv, next_interval);
-            }
+              if (next_interval > 0)
+                {
+                  rk3576_timer_settimeout_locked(priv, next_interval);
+                }
 
-          rk3576_timer_start_locked(priv);
+              rk3576_timer_start_locked(priv);
+            }
+          else
+            {
+              /* State changed (e.g. STOP) during the callback: leave the
+               * channel exactly as the ioctl set it.
+               */
+
+              priv->started = false;
+            }
         }
       else
         {
           flags = spin_lock_irqsave(&priv->lock);
-          priv->started = false;
+
+          /* One-shot: the channel has expired.  Only mark it stopped if
+           * the state did not change during the callback; a TCIOC_START
+           * issued meanwhile has already re-enabled the hardware.
+           */
+
+          if (priv->gen == gen)
+            {
+              priv->started = false;
+            }
         }
 
       spin_unlock_irqrestore(&priv->lock, flags);
@@ -323,6 +360,7 @@ static int rk3576_timer_start(FAR struct timer_lowerhalf_s *lower)
   int ret;
 
   flags = spin_lock_irqsave(&priv->lock);
+  priv->gen++;
   ret = rk3576_timer_start_locked(priv);
   spin_unlock_irqrestore(&priv->lock, flags);
 
@@ -351,6 +389,7 @@ static int rk3576_timer_stop(FAR struct timer_lowerhalf_s *lower)
   int ret;
 
   flags = spin_lock_irqsave(&priv->lock);
+  priv->gen++;
   ret = rk3576_timer_stop_locked(priv);
   spin_unlock_irqrestore(&priv->lock, flags);
 
@@ -466,6 +505,7 @@ static int rk3576_timer_settimeout(FAR struct timer_lowerhalf_s *lower,
   int ret;
 
   flags = spin_lock_irqsave(&priv->lock);
+  priv->gen++;
   ret = rk3576_timer_settimeout_locked(priv, timeout);
   spin_unlock_irqrestore(&priv->lock, flags);
 
@@ -573,16 +613,32 @@ FAR struct timer_lowerhalf_s *rk3576_timer_initialize(int timer, int channel)
 
   priv = &g_rk3576_timer[timer][channel];
 
-  /* Attach the interrupt handler before the channel can ever be enabled. */
+  /* Initialize the channel state before the IRQ line can ever be enabled:
+   * base/lock/ops first, then stop and clear the hardware, then resolve
+   * the counting clock, and only afterwards attach + enable the GIC IRQ.
+   * This guarantees that a stale pending interrupt can never enter the ISR
+   * with a half-initialized priv or an enabled counter.
+   */
 
-  ret = irq_attach(g_timer_irq[timer][channel], rk3576_timer_interrupt, priv);
-  if (ret < 0)
-    {
-      tmrerr("ERROR: failed to attach IRQ %d\n", g_timer_irq[timer][channel]);
-      return NULL;
-    }
+  priv->ops = &g_rk3576_timer_ops;
+  priv->base =
+      g_timer_base[timer] + (uint32_t)channel * RK3576_TIMER_CH_STRIDE;
+  priv->irq = g_timer_irq[timer][channel];
+  priv->started = false;
+  priv->timeout = 0;
+  priv->gen = 0;
+  priv->callback = NULL;
+  priv->arg = NULL;
+  priv->clk = NULL;
+  priv->freq = 0;
+  spin_lock_init(&priv->lock);
 
-  up_enable_irq(g_timer_irq[timer][channel]);
+  /* Leave the channel disabled with a clean control word and clear any
+   * stale pending interrupt status (W1C) before the GIC line is enabled.
+   */
+
+  rk3576_timer_putreg(priv, RK3576_TIMER_CONTROL, 0);
+  rk3576_timer_putreg(priv, RK3576_TIMER_INTSTATUS, TIMER_INTSTATUS_PD);
 
   /* Resolve the counting clock through the CLK framework.  Each channel
    * maps to clk_timerN with N = timer*6 + channel (TRM Table 14-1):
@@ -599,57 +655,43 @@ FAR struct timer_lowerhalf_s *rk3576_timer_initialize(int timer, int channel)
   if (clk == NULL)
     {
       tmrerr("ERROR: failed to get clock %s\n", clk_name);
-      goto errout_with_irq;
+      return NULL;
     }
 
   ret = clk_enable(clk);
   if (ret < 0)
     {
       tmrerr("ERROR: failed to enable clock %s\n", clk_name);
-      goto errout_with_irq;
+      return NULL;
     }
 
   freq = clk_get_rate(clk);
   if (freq == 0)
     {
       tmrerr("ERROR: clock %s has invalid rate 0\n", clk_name);
-      goto errout_with_clk;
+      clk_disable(clk);
+      return NULL;
     }
 
-  priv->ops = &g_rk3576_timer_ops;
-  priv->base =
-      g_timer_base[timer] + (uint32_t)channel * RK3576_TIMER_CH_STRIDE;
-  priv->irq = g_timer_irq[timer][channel];
-  priv->started = false;
-  priv->timeout = 0;
-  priv->callback = NULL;
-  priv->arg = NULL;
   priv->clk = clk;
   priv->freq = freq;
-  spin_lock_init(&priv->lock);
 
-  /* Leave the channel disabled with a clean control word. */
+  /* Attach the interrupt handler and enable the GIC line last, after priv
+   * is fully initialized and the channel is stopped with no pending
+   * interrupt, so the ISR can never observe an uninitialized state.
+   */
 
-  rk3576_timer_putreg(priv, RK3576_TIMER_CONTROL, 0);
+  ret = irq_attach(g_timer_irq[timer][channel], rk3576_timer_interrupt, priv);
+  if (ret < 0)
+    {
+      tmrerr("ERROR: failed to attach IRQ %d\n", g_timer_irq[timer][channel]);
+      clk_disable(clk);
+      return NULL;
+    }
+
+  up_enable_irq(g_timer_irq[timer][channel]);
 
   return (FAR struct timer_lowerhalf_s *)priv;
-
-errout_with_clk:
-  /* Disable the counting clock enabled above, then fall through to undo
-   * the interrupt setup.
-   */
-
-  clk_disable(clk);
-
-errout_with_irq:
-  /* Undo up_enable_irq() before detaching the handler so the GIC does not
-   * keep the line enabled with no handler attached, in case the channel is
-   * ever started later.
-   */
-
-  up_disable_irq(g_timer_irq[timer][channel]);
-  irq_detach(g_timer_irq[timer][channel]);
-  return NULL;
 }
 
 #endif /* CONFIG_RK3576_TIMER */
