@@ -32,19 +32,19 @@
  * Private Functions
  ****************************************************************************/
 
-/* Number of "rendered but not yet fully written" generations for one screen
+/* Number of "rendered but not yet fully written" slots for one screen
  * (each occupies one offscreen buffer). */
 
 static int bg_pending_count(const nyabula_bg_t *bg, int sid)
 {
   int n = 0;
 
-  if (bg->ready_gen[sid] != -1)
+  if (bg->ready_slot[sid] != -1)
     {
       n++;
     }
 
-  if (bg->xfer_gen[sid] != -1)
+  if (bg->xfer_slot[sid] != -1)
     {
       n++;
     }
@@ -52,14 +52,44 @@ static int bg_pending_count(const nyabula_bg_t *bg, int sid)
   return n;
 }
 
-/* Render gating: a new render needs one working buffer; after completion the
- * generation becomes "ready" (still one buffer).  Allowed only while
- * pending <= 1 (pending 1 + rendering 1 = 2, legal); pending == 2 would
- * need a third buffer, so reject and defer (voluntarily drop a frame). */
+/* Render gating: a new render needs one working slot; after completion the
+ * slot becomes "ready" (still one slot).  Allowed only while pending <= 1
+ * (pending 1 + rendering 1 = 2, legal); pending == 2 would need a third
+ * slot, so reject and defer (voluntarily drop a frame). */
 
 static bool bg_can_render(const nyabula_bg_t *bg, int sid)
 {
   return bg_pending_count(bg, sid) <= 1;
+}
+
+/* Pick a free offscreen slot for screen sid.  A slot is free iff it is NOT
+ * the rendering slot AND NOT the ready slot AND NOT the xfer slot (strict
+ * three-state check, mirroring the reference BlankGatedScheduler's
+ * _free_slot with busy = {render, ready, xfer}).  Prefers next_slot, then
+ * the other; returns -1 if both are busy. */
+
+static int bg_free_slot(const nyabula_bg_t *bg, int sid)
+{
+  int prefer = bg->next_slot[sid];
+  int slot;
+
+  /* Try preferred slot first, then the alternate. */
+  for (slot = prefer; ; slot = 1 - slot)
+    {
+      if (slot != bg->rendering_slot[sid] &&
+          slot != bg->ready_slot[sid]     &&
+          slot != bg->xfer_slot[sid])
+        {
+          return slot;
+        }
+
+      if (slot == 1 - prefer)
+        {
+          break;
+        }
+    }
+
+  return -1;
 }
 
 /* Try to start rendering a new frame for screen sid (gated by double-buffer
@@ -68,12 +98,14 @@ static bool bg_can_render(const nyabula_bg_t *bg, int sid)
 
 static void bg_try_start_render(nyabula_bg_t *bg, int sid)
 {
+  int slot;
+
   if (!bg->want[sid])
     {
       return;
     }
 
-  if (bg->rendering_gen[sid] != -1)
+  if (bg->rendering_slot[sid] != -1)
     {
       return; /* This screen is already rendering. */
     }
@@ -85,13 +117,21 @@ static void bg_try_start_render(nyabula_bg_t *bg, int sid)
       return;
     }
 
-  bg->gen++;
-  bg->rendering_gen[sid] = bg->gen;
+  /* Algorithm owns slot selection (mirrors _free_slot in the reference). */
+  slot = bg_free_slot(bg, sid);
+  if (slot < 0)
+    {
+      /* Should be unreachable given bg_can_render above, but stay safe. */
+      return;
+    }
+
+  bg->rendering_slot[sid] = slot;
+  bg->next_slot[sid] = 1 - slot;
   bg->want[sid] = false;
 
   if (bg->cb.request_render != NULL)
     {
-      bg->cb.request_render(bg->screen[sid], bg->gen);
+      bg->cb.request_render(bg->screen[sid], slot);
     }
 }
 
@@ -112,28 +152,28 @@ static void bg_try_start_xfer(nyabula_bg_t *bg)
    * write A, else if B.pending && B.in_blanking -> write B). */
   for (s = 0; s < NYABULA_BG_MAX_SCREENS; s++)
     {
-      int gen;
+      int slot;
       bool ok;
 
-      if (bg->ready_gen[s] == -1 || !bg->in_blanking[s])
+      if (bg->ready_slot[s] == -1 || !bg->in_blanking[s])
         {
           continue;
         }
 
-      gen = bg->ready_gen[s];
+      slot = bg->ready_slot[s];
       bg->xfer_busy = true;
-      bg->ready_gen[s] = -1;
-      bg->xfer_gen[s] = gen;
+      bg->ready_slot[s] = -1;
+      bg->xfer_slot[s] = slot;
 
       ok = (bg->cb.request_write != NULL) &&
-           bg->cb.request_write(bg->screen[s], gen);
+           bg->cb.request_write(bg->screen[s], slot);
       if (!ok)
         {
           /* Enqueue failed: roll back so a "phantom in-flight" never stalls
-           * the single-flight bus / generation accounting. */
+           * the single-flight bus / slot accounting. */
           bg->xfer_busy = false;
-          bg->xfer_gen[s] = -1;
-          bg->ready_gen[s] = gen;
+          bg->xfer_slot[s] = -1;
+          bg->ready_slot[s] = slot;
         }
 
       return;
@@ -152,14 +192,14 @@ void nyabula_bg_init(nyabula_bg_t *bg, const nyabula_bg_callbacks_t *cb)
 
   for (i = 0; i < NYABULA_BG_MAX_SCREENS; i++)
     {
-      bg->rendering_gen[i] = -1;
-      bg->ready_gen[i] = -1;
-      bg->xfer_gen[i] = -1;
+      bg->rendering_slot[i] = -1;
+      bg->ready_slot[i] = -1;
+      bg->xfer_slot[i] = -1;
+      bg->next_slot[i] = 0;
       bg->in_blanking[i] = false;
       bg->want[i] = false;
     }
 
-  bg->gen = 0;
   bg->xfer_busy = false;
   sem_init(&bg->lock, 0, 1);
 
@@ -201,21 +241,21 @@ void nyabula_bg_on_blank_start(nyabula_bg_t *bg, int sid)
 }
 
 /* ------------------------------------------------------------------
- * Render done: content is ready; the generation moves to "ready" (working
- * buffer -> ready buffer; buffer occupancy is unchanged).  Kick off a write
+ * Render done: content is ready; the slot moves to "ready" (working
+ * slot -> ready slot; buffer occupancy is unchanged).  Kick off a write
  * (if in blanking) and the next render.
  * ------------------------------------------------------------------ */
 
-void nyabula_bg_on_render_done(nyabula_bg_t *bg, int sid, int gen)
+void nyabula_bg_on_render_done(nyabula_bg_t *bg, int sid, int slot)
 {
   sem_wait(&bg->lock);
 
-  if (bg->rendering_gen[sid] == gen)
+  if (bg->rendering_slot[sid] == slot)
     {
-      bg->rendering_gen[sid] = -1;
+      bg->rendering_slot[sid] = -1;
     }
 
-  bg->ready_gen[sid] = gen;
+  bg->ready_slot[sid] = slot;
 
   bg_try_start_xfer(bg);
   bg_try_start_render(bg, sid);
@@ -225,26 +265,26 @@ void nyabula_bg_on_render_done(nyabula_bg_t *bg, int sid, int gen)
 
 /* ------------------------------------------------------------------
  * Whole-frame write done: release the single-flight bus and (because a
- * generation is complete exactly when its single whole-frame write ends)
- * tell the framework the buffer is free; then try the next write / render.
+ * slot is complete exactly when its single whole-frame write ends) tell the
+ * framework the buffer is free; then try the next write / render.
  * ------------------------------------------------------------------ */
 
-void nyabula_bg_on_xfer_done(nyabula_bg_t *bg, int sid, int gen)
+void nyabula_bg_on_xfer_done(nyabula_bg_t *bg, int sid, int slot)
 {
   sem_wait(&bg->lock);
 
-  if (bg->xfer_gen[sid] == gen)
+  if (bg->xfer_slot[sid] == slot)
     {
-      bg->xfer_gen[sid] = -1;
+      bg->xfer_slot[sid] = -1;
     }
 
   bg->xfer_busy = false;
 
-  /* The whole-frame write of gen is complete: the physical buffer is free
+  /* The whole-frame write of slot is complete: the physical buffer is free
    * for LVGL to reuse. */
-  if (bg->cb.on_gen_complete != NULL)
+  if (bg->cb.on_buf_free != NULL)
     {
-      bg->cb.on_gen_complete(bg->screen[sid], gen);
+      bg->cb.on_buf_free(bg->screen[sid], slot);
     }
 
   bg_try_start_xfer(bg);

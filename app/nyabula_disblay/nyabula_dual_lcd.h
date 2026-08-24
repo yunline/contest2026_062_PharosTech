@@ -18,6 +18,30 @@
  *
  ****************************************************************************/
 
+/****************************************************************************
+ * SINGLE-INSTANCE (singleton) contract
+ *
+ * This module is explicitly a single-instance design.  The per-screen
+ * full-frame double buffers are statically allocated (g_nyabula_fb in
+ * nyabula_dual_lcd.c) so their base addresses are 64B-aligned and in low
+ * 32-bit memory, enabling DMA-direct whole-frame writes to the QSPI FSPI
+ * lower-half without a bounce buffer.  A static buffer is inherently
+ * unique process-wide, so only ONE nyabula_dual_lcd_create() may be
+ * outstanding at a time.
+ *
+ * Consequence:
+ *   - Calling nyabula_dual_lcd_create() while an instance already exists
+ *     (and has not been destroyed) FAILS and returns NULL.
+ *   - After nyabula_dual_lcd_destroy(), a new instance may be created
+ *     again (the static buffers are reused by the new instance).
+ *
+ * If a true multi-instance design were ever required, the static buffers
+ * would have to be moved to per-instance dynamic allocation, which would
+ * sacrifice the DMA-direct property (dynamic heap only guarantees 8B
+ * alignment / arbitrary placement) -- a deliberate trade-off this module
+ * does not make.
+ ****************************************************************************/
+
 #ifndef __NYABULA_DUAL_LCD_H
 #define __NYABULA_DUAL_LCD_H
 
@@ -60,6 +84,27 @@ extern "C" {
 #define NYABULA_DUAL_LCD_DEF_HEIGHT 360
 #endif
 
+/* Compile-time size of one full-frame RGB565 buffer.  The two offscreen
+ * double buffers per screen are statically allocated (see
+ * nyabula_dual_lcd.c) so their base addresses can be 64B cache-line aligned
+ * and physically contiguous, letting the QSPI FSPI lower-half use a direct
+ * DMA transfer with zero bounce.
+ *
+ * NOTE: this DMA-friendly static allocation is only correct when BOTH of
+ * these hold on the target (checked/commented at the point of use):
+ *   1) Flat-mapping: the kernel runs in a single address space where the
+ *      virtual address equals the physical address, so a 64B-aligned C
+ *      array is also physically 64B-aligned for the DMA engine.
+ *   2) The .bss (and hence this array) links below 4 GiB, inside the DMA
+ *      engine's 32-bit SAR/DAR addressable range.
+ * If either is violated the buffers fall back to the lower-half's bounce /
+ * polling path and the DMA-direct benefit is lost (correctness is NOT
+ * affected, only throughput).
+ */
+
+#define NYABULA_DUAL_LCD_FRAME_BYTES \
+  (NYABULA_DUAL_LCD_DEF_WIDTH * NYABULA_DUAL_LCD_DEF_HEIGHT * 2)
+
 /* Default refresh rate in Hz.  The TE source (see nyabula_te.h) derives the
  * software frame clock from this when the SW source is selected. */
 
@@ -86,14 +131,14 @@ extern "C" {
  * Public Types
  ****************************************************************************/
 
-/* A full-frame RGB565 offscreen buffer.  "generation" (gen) is a
- * monotonically increasing number identifying the content frame held in
- * the buffer.  -1 means "no valid rendered content yet". */
+/* A full-frame RGB565 offscreen buffer.  `busy` is true while the buffer
+ * holds rendered-but-not-yet-freed content (i.e. it must not be reused by
+ * LVGL until its whole-frame write completes and the slot is released). */
 
 typedef struct
 {
   uint8_t *data; /* Buffer base address (buf_size bytes) */
-  int gen;       /* Content generation, -1 = invalid / free */
+  bool busy;     /* true = occupied (rendered / awaiting write); false = free */
 } nyabula_buf_t;
 
 /* Forward declaration: each screen holds a back-pointer to its owning dual
@@ -129,15 +174,21 @@ struct nyabula_screen
   /* Double buffers (full screen each) */
   nyabula_buf_t buf[2];
 
-  /* Generation currently being rendered by LVGL (assigned by the algorithm
-   * via request_render; flush_cb binds this generation to the physical
-   * buffer and reports on_render_done back). */
-  int render_gen;
+  /* LVGL draw-buffer descriptors bound to buf[].data.  The algorithm picks
+   * the offscreen slot to render into; request_render redirects LVGL to that
+   * slot by reordering these two via lv_display_set_draw_buffers (whose
+   * first argument becomes the active draw buffer). */
+  lv_draw_buf_t draw_buf[2];
 
-  /* Posted by the transfer thread whenever a buffer generation becomes
-   * fully written (whole-frame DMA done) and is therefore free for LVGL to
-   * reuse.  The render thread's flush_wait_cb waits here while a target
-   * buffer is still locked. */
+  /* The slot the algorithm has selected for the next render (0/1, or -1 if
+   * none pending).  Written by bg_request_render under st_mutex; consumed by
+   * the render loop to point LVGL at the right buffer before lv_refr_now(). */
+  int pending_slot;
+
+  /* Posted by the transfer thread whenever a buffer slot becomes fully
+   * written (whole-frame DMA done) and is therefore free for LVGL to reuse.
+   * The render thread's flush_wait_cb waits here while a target buffer is
+   * still locked. */
   sem_t buf_free;
 
   /* TE-driven render request.  The TE scan-start edge (via the algorithm)
@@ -167,12 +218,11 @@ typedef struct nyabula_screen nyabula_screen_t;
 
 /* A pending whole-frame write queued for the transfer thread.  The BlankGated
  * scheduler writes the ENTIRE frame (all total_lines rows, from row 0) in one
- * blocking QSPI DMA per generation, gated on the target screen's blanking. */
+ * blocking QSPI DMA per slot, gated on the target screen's blanking. */
 typedef struct
 {
   int screen_id; /* 0 or 1 */
-  int buf_idx;   /* Offscreen buffer holding the content */
-  int gen;       /* Content generation */
+  int buf_idx;   /* Offscreen buffer slot holding the content */
 } nyabula_write_job_t;
 
 /* Dual screen context.  The tag is exposed so the audit interface (in

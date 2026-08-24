@@ -44,17 +44,21 @@
  *   - TE falling edge (HIGH -> LOW) = blanking ended, a new frame scan
  *     begins.  A new render is requested here.
  *
- * State (per screen, plus a shared-bus single-flight flag):
- *   rendering_gen : generation currently being rendered by LVGL.
- *   ready_gen     : rendered generation awaiting its whole-frame write.
- *   xfer_gen      : generation whose whole-frame write is in flight.
- *   in_blanking   : screen is inside the vertical blanking window.
- *   want          : a new frame is wanted (set on scan start, consumed by
- *                   the next successful render request).
+ * State (per screen, plus a shared-bus single-flight flag).  A screen owns
+ * exactly two offscreen buffers (slots 0 and 1); each slot is in exactly one
+ * of the three roles below, or is free.  This mirrors the reference
+ * BlankGatedScheduler's slot-index state (render[s]/ready[s]/xfer[s]).
+ *   rendering_slot : the slot currently being rendered into by LVGL (-1 none).
+ *   ready_slot     : the slot holding a rendered frame awaiting its write.
+ *   xfer_slot      : the slot whose whole-frame write is in flight (-1 none).
+ *   next_slot      : rotation preference when picking a free slot.
+ *   in_blanking    : screen is inside the vertical blanking window.
+ *   want           : a new frame is wanted (set on scan start, consumed by
+ *                    the next successful render request).
  *
  * Invariants:
  *   1) render gating  : a new render is only requested while at most one
- *                       buffer is busy (pending <= 1, so pending + rendering
+ *                       slot is busy (pending <= 1, so pending + rendering
  *                       <= 2 legal double buffer).  Otherwise the render is
  *                       deferred (algorithm voluntarily skips a frame) and
  *                       retried on a later edge once a write releases a
@@ -67,8 +71,8 @@
  *                       keeps LVGL from drawing into a buffer whose write is
  *                       not finished; the render gate keeps it from being
  *                       needed in the healthy case.
- *   4) generation is complete exactly when its single whole-frame write
- *       finishes (no block-ledger needed, unlike v8's front/back halves).
+ *   4) a slot is complete exactly when its single whole-frame write finishes
+ *       (no block-ledger needed, unlike v8's front/back halves).
  *
  * All state lives in this struct (one instance per dual-LCD context, shared
  * by both screens so the single-bus arbitration is done here).
@@ -102,22 +106,30 @@ struct nyabula_screen;
 
 typedef struct
 {
-  /* Request a full-frame render of a new generation gen for a screen.  The
-   * framework implements this by driving LVGL to render the screen (on the
-   * render-thread context). */
-  void (*request_render)(struct nyabula_screen *screen, int gen);
+  /* Request a full-frame render into offscreen buffer `slot` (0 or 1) for a
+   * screen.  The algorithm has already selected the slot (like the reference
+   * BlankGatedScheduler's _free_slot); the framework must redirect LVGL to
+   * draw into that exact buffer. */
+  void (*request_render)(struct nyabula_screen *screen, int slot);
 
-  /* Submit the WHOLE frame (all total_lines rows) of generation gen to the
-   * transfer thread (enqueued, executed as one blocking QSPI DMA).  Returns
-   * bool: true = enqueued (an on_xfer_done will follow); false = enqueue
-   * failed and the framework dropped the job.  The algorithm rolls back on
-   * false, avoiding a phantom in-flight that would stall the pipeline. */
-  bool (*request_write)(struct nyabula_screen *screen, int gen);
+  /* Submit the WHOLE frame (all total_lines rows) held in buffer `slot` to
+   * the transfer thread (enqueued, executed as one blocking QSPI DMA).
+   * Returns bool: true = enqueued (an on_xfer_done will follow); false =
+   * enqueue failed and the framework dropped the job.  The algorithm rolls
+   * back on false, avoiding a phantom in-flight that would stall the
+   * pipeline. */
+  bool (*request_write)(struct nyabula_screen *screen, int slot);
 
-  /* The whole-frame write of generation gen has completed; the generation's
-   * physical offscreen buffer is returned to the CPU and the framework may
-   * mark it free for LVGL reuse. */
-  void (*on_gen_complete)(struct nyabula_screen *screen, int gen);
+  /* The whole-frame write of buffer `slot` has completed; the physical
+   * offscreen buffer is returned to the CPU and the framework may mark it
+   * free for LVGL reuse. */
+  void (*on_buf_free)(struct nyabula_screen *screen, int slot);
+
+  /* Optional: a render request was deferred/dropped because the
+   * double-buffer was full (bg_can_render failed).  The framework only uses
+   * this to count drops for profiling (nyabula_display_audit); it must not
+   * change its behaviour.  May be NULL. */
+  void (*on_render_drop)(struct nyabula_screen *screen);
 } nyabula_bg_callbacks_t;
 
 /* BlankGated algorithm context (one per dual-LCD context, shared by both
@@ -125,14 +137,17 @@ typedef struct
 
 typedef struct nyabula_bg_s
 {
-  /* Generation counter (algorithm-maintained, not framework-owned). */
-  int gen;
+  /* Per-screen ledger.  Each screen owns two offscreen buffers (slots 0 and
+   * 1); a slot lives in exactly one of the three states below (or is free).
+   * -1 = no slot in that state.  This mirrors the reference
+   * BlankGatedScheduler's render[s]/ready[s]/xfer[s] slot indices. */
+  int rendering_slot[NYABULA_BG_MAX_SCREENS];
+  int ready_slot[NYABULA_BG_MAX_SCREENS];
+  int xfer_slot[NYABULA_BG_MAX_SCREENS];
 
-  /* Per-screen ledger.  A generation lives in exactly one of the three
-   * states below; -1 = no generation in that state. */
-  int rendering_gen[NYABULA_BG_MAX_SCREENS];
-  int ready_gen[NYABULA_BG_MAX_SCREENS];
-  int xfer_gen[NYABULA_BG_MAX_SCREENS];
+  /* Per-screen slot rotation preference (mirrors next_slot[s] in the
+   * reference): the first slot to try when picking a free buffer. */
+  int next_slot[NYABULA_BG_MAX_SCREENS];
 
   /* Per-screen: inside the blanking window / wants a new frame. */
   bool in_blanking[NYABULA_BG_MAX_SCREENS];
@@ -172,11 +187,11 @@ void nyabula_bg_on_scan_start(nyabula_bg_t *bg, int sid);
  * begins): set in_blanking and try to start a whole-frame write. */
 void nyabula_bg_on_blank_start(nyabula_bg_t *bg, int sid);
 
-/* framework -> algorithm: one render completed, content gen is ready. */
-void nyabula_bg_on_render_done(nyabula_bg_t *bg, int sid, int gen);
+/* framework -> algorithm: render into `slot` completed, content is ready. */
+void nyabula_bg_on_render_done(nyabula_bg_t *bg, int sid, int slot);
 
-/* framework -> algorithm: the whole-frame write of gen completed. */
-void nyabula_bg_on_xfer_done(nyabula_bg_t *bg, int sid, int gen);
+/* framework -> algorithm: the whole-frame write of `slot` completed. */
+void nyabula_bg_on_xfer_done(nyabula_bg_t *bg, int sid, int slot);
 
 #ifdef __cplusplus
 }
