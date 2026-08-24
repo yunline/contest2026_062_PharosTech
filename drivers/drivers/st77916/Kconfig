@@ -36,17 +36,4 @@ config LCD_ST77916_CHIP_TYPE_GC9B72
 
 endchoice
 
-config LCD_ST77916_SWAP_RGB565
-    bool "Byte-swap RGB565 pixel data before sending to the panel"
-    default y
-    ---help---
-        When enabled, RGB565 (16-bit) pixel data is byte-swapped while
-        being staged into the DMA buffer so the panel GRAM receives the
-        big-endian byte order it expects.  This is the default and is
-        implemented by st77916_rev16_cpy().
-
-        Disable this if the panel/board does not require the byte swap;
-        in that case st77916_rev16_cpy() simply forwards to memcpy() and
-        no endianness conversion is applied.
-
 endif # LCD_ST77916

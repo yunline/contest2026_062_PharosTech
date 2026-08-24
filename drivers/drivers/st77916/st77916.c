@@ -53,21 +53,10 @@
 #include <string.h>
 #include <sys/types.h>
 
-/* NEON intrinsics for the SIMD byte-swap path in st77916_rev16_cpy().
- * __ARM_NEON is predefined by the compiler only when the target actually
- * has NEON enabled, so the header is pulled in under the same condition.
- */
-
-#if defined(__ARM_NEON) || defined(CONFIG_ARM_HAVE_NEON) || \
-    defined(CONFIG_ARM64_HAVE_NEON)
-#include <arm_neon.h>
-#endif
-
 #include <nuttx/arch.h>
 #include <nuttx/clock.h>
 #include <nuttx/kmalloc.h>
 #include <nuttx/lcd/lcd.h>
-#include <nuttx/mutex.h>
 #include <nuttx/signal.h>
 #include <nuttx/spi/qspi.h>
 
@@ -159,25 +148,6 @@ struct st77916_lcd_dev_s
    */
 
   st77916_select_cb_t select_cb;
-
-  /* DMA-safe staging buffer, one full framebuffer in size, allocated via
-   * QSPI_ALLOC() in st77916_lcdinitialize().  In st77916_putarea() the
-   * caller's buffer is copied here (resolving any stride gaps) so the
-   * QSPI transfer always uses an address suitable for the DMA engine.
-   */
-
-  uint8_t *dma_buf;
-
-  /* Serializes the complete putarea() transaction: staging the caller's
-   * pixels into dma_buf AND the subsequent QSPI transfer.  The QSPI bus
-   * lock alone cannot protect dma_buf because it is taken only after the
-   * staging copy, so without this lock two concurrent putarea() calls
-   * could overwrite dma_buf while the other thread waits on the bus lock.
-   * A recursive mutex keeps putrun() -> putarea() and future nested
-   * read-modify-write paths safe.
-   */
-
-  rmutex_t putarea_lock;
 };
 
 /****************************************************************************
@@ -203,7 +173,6 @@ static int st77916_getplaneinfo(struct lcd_dev_s *dev, unsigned int planeno,
 
 /* LCD helper functions */
 
-static void *st77916_rev16_cpy(void *dst, const void *src, size_t n);
 static uint8_t st77916_bpp(uint8_t fmt);
 static int st77916_command(struct st77916_lcd_dev_s *priv, uint8_t cmd,
                            const uint8_t *data, uint16_t data_len);
@@ -222,101 +191,6 @@ static int st77916_setpower(struct lcd_dev_s *dev, int power);
 /****************************************************************************
  * Private Functions
  ****************************************************************************/
-
-/****************************************************************************
- * Name: st77916_rev16_cpy
- *
- * Description:
- *   Copy n bytes from src to dst while byte-swapping every 16-bit word:
- *   byte 0 <-> byte 1, byte 2 <-> byte 3, and so on.  The signature
- *   matches memcpy(), so callers can substitute it in place of memcpy()
- *   to perform an endianness conversion on the fly.
- *
- *   This is used, for example, to convert little-endian RGB565 pixel data
- *   into the big-endian byte order expected by the panel GRAM.
- *
- *   When CONFIG_LCD_ST77916_SWAP_RGB565 is disabled this function simply
- *   forwards to memcpy() and no byte swapping is performed.
- *
- *   The implementation picks the fastest path available at build time:
- *   - NEON SIMD (vrev16q_u8) when the target has it, giving the largest
- *     throughput by swapping 8 halfwords per instruction;
- *   - __builtin_bswap16() on GCC/Clang (a single REV16 on ARM);
- *   - a portable byte-by-byte fallback otherwise.
- *
- * Input Parameters:
- *   dst - Destination buffer.  Must not overlap src.
- *   src - Source buffer.
- *   n   - Number of bytes to copy.  Must be even.
- *
- * Returned Value:
- *   Pointer to dst, like memcpy().
- *
- ****************************************************************************/
-
-static void *st77916_rev16_cpy(void *dst, const void *src, size_t n)
-{
-#if !defined(CONFIG_LCD_ST77916_SWAP_RGB565)
-  /* Byte swap disabled by configuration: a plain copy is enough.  The
-   * signature matches memcpy(), so just forward to it.
-   */
-
-  return memcpy(dst, src, n);
-#endif
-
-  DEBUGASSERT(n % 2 == 0);
-
-#if defined(__ARM_NEON) || defined(CONFIG_ARM_HAVE_NEON) || \
-    defined(CONFIG_ARM64_HAVE_NEON)
-  /* NEON: swap every adjacent byte pair using vrev16q_u8(), which
-   * reverses the two bytes of each 16-bit halfword across a 128-bit
-   * vector, i.e. 8 halfwords per instruction.  A scalar tail handles
-   * any leftover bytes (n is always even, so the tail is 2-aligned).
-   */
-
-  uint8_t *out = dst;
-  const uint8_t *in = src;
-  size_t i = 0;
-
-  for (; i + 16 <= n; i += 16)
-    {
-      vst1q_u8(out + i, vrev16q_u8(vld1q_u8(in + i)));
-    }
-
-  for (; i < n; i += 2)
-    {
-      out[i] = in[i + 1];
-      out[i + 1] = in[i];
-    }
-#elif defined(__GNUC__) || defined(__clang__)
-  /* GCC/Clang: use __builtin_bswap16() to byte-swap each 16-bit
-   * halfword, which the compiler lowers to a single REV16 on ARM.
-   */
-
-  const uint16_t *in = src;
-  uint16_t *out = dst;
-  size_t i;
-
-  for (i = 0; i < n / 2; i++)
-    {
-      out[i] = __builtin_bswap16(in[i]);
-    }
-#else
-  /* Portable fallback: swap adjacent byte pairs by hand. */
-
-  uint8_t *out = dst;
-  const uint8_t *in = src;
-  size_t i;
-
-  for (i = 0; i < n; i += 2)
-    {
-      out[i] = in[i + 1];
-      out[i + 1] = in[i];
-    }
-#endif
-
-  return dst;
-}
 
 /****************************************************************************
  * Name: st77916_bpp
@@ -451,9 +325,13 @@ static int st77916_putrun(struct lcd_dev_s *dev, fb_coord_t row,
  *   in GRAM coordinates: priv->xoff/yoff are added to the column/row
  *   addresses so callers only deal with framebuffer coordinates.
  *
- *   NOTE: the caller's buffer is copied into a DMA-safe staging buffer,
- *   resolving any stride gaps: if stride is nonzero it is treated as the
- *   row pitch in bytes and each row is packed tight in the staging buffer.
+ *   NOTE: the caller's buffer is passed straight through to the QSPI
+ *   lower-half (QSPI_MEMORY) with no staging copy.  Any DMA-related
+ *   buffer prerequisites (alignment, addressability) are the QSPI
+ *   lower-half's responsibility, not this driver's.  stride must be 0 or
+ *   equal to one tight row (row_bytes): the transfer is sent as a single
+ *   contiguous block, so a stride introducing a row gap cannot be
+ *   expressed without a staging copy and is rejected with -EINVAL.
  *
  ****************************************************************************/
 
@@ -468,21 +346,15 @@ static int st77916_putarea(struct lcd_dev_s *dev, fb_coord_t row_start,
   uint32_t cols;
   uint32_t bpp;
   uint32_t row_bytes;
-  const uint8_t *src;
-  uint8_t *dst;
-  uint32_t i;
   int ret;
 
   DEBUGASSERT(priv != NULL);
   DEBUGASSERT(priv->qspi != NULL);
-  DEBUGASSERT(priv->dma_buf != NULL);
   DEBUGASSERT(buffer != NULL);
 
-  /* Validate the caller-supplied geometry before touching dma_buf.
-   * row_start > row_end or col_start > col_end would make the unsigned
-   * row/col counts below underflow, coordinates outside xres/yres would
-   * walk past the end of the DMA staging buffer, and a nonzero stride
-   * smaller than one tight row would make the per-row copy overlap.
+  /* Validate the caller-supplied geometry.  row_start > row_end or
+   * col_start > col_end would make the unsigned row/col counts below
+   * underflow, and coordinates outside xres/yres are out of range.
    */
 
   if (row_start > row_end || col_start > col_end)
@@ -500,58 +372,16 @@ static int st77916_putarea(struct lcd_dev_s *dev, fb_coord_t row_start,
   bpp = st77916_bpp(priv->fmt);
   row_bytes = cols * (bpp >> 3);
 
-  if (stride != 0 && stride < row_bytes)
+  /* The caller's buffer is passed straight to the QSPI lower-half as one
+   * contiguous block of rows * row_bytes bytes, so there is no staging to
+   * absorb a row pitch.  stride must therefore be 0 or exactly row_bytes
+   * (a tightly packed area); anything else cannot be represented as a
+   * single contiguous transfer and is rejected.
+   */
+
+  if (stride != 0 && stride != row_bytes)
     {
       return -EINVAL;
-    }
-
-  /* Serialize the whole transaction.  dma_buf is written here and later
-   * read by the QSPI transfer, and the QSPI bus lock is only taken below;
-   * a concurrent putarea() could otherwise overwrite dma_buf while this
-   * thread waits on the bus lock and send another frame's data.
-   */
-
-  ret = nxrmutex_lock(&priv->putarea_lock);
-  if (ret < 0)
-    {
-      lcderr("ERROR: Failed to lock putarea: %d\n", ret);
-      return ret;
-    }
-
-  /* Stage the source rows into the DMA buffer.  When there is no stride
-   * gap (stride == 0 or equal to the tight row size) the whole area is
-   * already contiguous and can be copied in one shot; otherwise each row
-   * is packed tight, de-striding on the fly.
-   */
-
-  if (stride == 0 || stride == row_bytes)
-    {
-      if (priv->fmt == FB_FMT_RGB16_565)
-        {
-          st77916_rev16_cpy(priv->dma_buf, buffer, rows * row_bytes);
-        }
-      else
-        {
-          memcpy(priv->dma_buf, buffer, rows * row_bytes);
-        }
-    }
-  else
-    {
-      src = buffer;
-      dst = priv->dma_buf;
-      for (i = 0; i < rows; i++)
-        {
-          if (priv->fmt == FB_FMT_RGB16_565)
-            {
-              st77916_rev16_cpy(dst, src, row_bytes);
-            }
-          else
-            {
-              memcpy(dst, src, row_bytes);
-            }
-          dst += row_bytes;
-          src += stride;
-        }
     }
 
   /* Write window in GRAM coordinates: framebuffer coordinates plus the
@@ -582,7 +412,7 @@ static int st77916_putarea(struct lcd_dev_s *dev, fb_coord_t row_start,
       goto xfer_err;
     }
 
-  /* Data payload: the staged tightly-packed pixels of the whole area.
+  /* Data payload: the caller's pixels, passed through without staging.
    * The QSPI memory opcode (ST77916_QSPI_CMD_WRITE_1_4_4, selected per
    * chip in st77916_hw.h) sends the address single-line and the data on
    * four lines; the opcode itself stays single-line because
@@ -594,7 +424,10 @@ static int st77916_putarea(struct lcd_dev_s *dev, fb_coord_t row_start,
   meminfo.cmd = ST77916_QSPI_CMD_WRITE_1_4_4;
   meminfo.addrlen = ST77916_QSPI_ADDRLEN;
   meminfo.addr = ST77916_CMD_RAMWR << 8; /* 0x00XX00 */
-  meminfo.buffer = priv->dma_buf;
+  /* Write-only transfer: the QSPI lower-half reads this buffer and must
+   * not modify it, so the const qualification is dropped explicitly.
+   */
+  meminfo.buffer = (FAR void *)buffer;
   meminfo.buflen = rows * row_bytes;
 
   ret = QSPI_MEMORY(priv->qspi, &meminfo);
@@ -607,13 +440,10 @@ static int st77916_putarea(struct lcd_dev_s *dev, fb_coord_t row_start,
 
   st77916_unlock(priv);
 
-  nxrmutex_unlock(&priv->putarea_lock);
-
   return OK;
 
 xfer_err:
   st77916_unlock(priv);
-  nxrmutex_unlock(&priv->putarea_lock);
 
   return ret;
 }
@@ -1047,30 +877,6 @@ struct lcd_dev_s *st77916_lcdinitialize(
 
   priv->power = 0;
 
-  /* Serialize the complete putarea() transaction; see putarea_lock. */
-
-  if (nxrmutex_init(&priv->putarea_lock) < 0)
-    {
-      lcderr("ERROR: Failed to initialize putarea lock\n");
-      kmm_free(priv);
-      return NULL;
-    }
-
-  /* Allocate a DMA-safe staging buffer large enough for one full
-   * framebuffer, so that putarea() can resolve stride gaps and provide a
-   * physically contiguous, low-32-bit address to the QSPI DMA engine.
-   */
-
-  priv->dma_buf =
-      QSPI_ALLOC(priv->qspi, (size_t)xres * yres * (st77916_bpp(fmt) >> 3));
-  if (priv->dma_buf == NULL)
-    {
-      lcderr("ERROR: Failed to allocate DMA buffer\n");
-      nxrmutex_destroy(&priv->putarea_lock);
-      kmm_free(priv);
-      return NULL;
-    }
-
   /* Initialize the lower-half vtable */
 
   priv->dev.getvideoinfo = st77916_getvideoinfo;
@@ -1186,14 +992,6 @@ struct lcd_dev_s *st77916_lcdinitialize(
 xfer_err:
   st77916_unlock(priv);
 
-  if (priv->dma_buf)
-    {
-      QSPI_FREE(priv->qspi, priv->dma_buf);
-      priv->dma_buf = NULL;
-    }
-
-  nxrmutex_destroy(&priv->putarea_lock);
-
   kmm_free(priv);
 
   return NULL;
@@ -1228,18 +1026,6 @@ void st77916_lcduninitialize(struct lcd_dev_s *dev)
   /* Panel power off */
 
   st77916_setpower(dev, 0);
-
-  /* Release the DMA-safe staging buffer */
-
-  if (priv->dma_buf)
-    {
-      QSPI_FREE(priv->qspi, priv->dma_buf);
-      priv->dma_buf = NULL;
-    }
-
-  /* Release the putarea serialization lock */
-
-  nxrmutex_destroy(&priv->putarea_lock);
 
   /* Free the device private structure */
 
