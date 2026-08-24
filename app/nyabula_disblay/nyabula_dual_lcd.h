@@ -112,20 +112,15 @@ extern "C" {
 #define NYABULA_DUAL_LCD_REFRESH_HZ 60
 #endif
 
-/* Transfer thread priority (NuttX: lower number = higher priority).  The
- * transfer (blocking PUTAREA DMA) sits below the TE source but above the
- * caller-hosted render loop so the DMA keeps the bus busy.  The TE priority
- * lives in nyabula_te.h (NYABULA_TE_PRIORITY). */
-
-#ifndef NYABULA_DUAL_LCD_TRANSFER_PRIORITY
-#define NYABULA_DUAL_LCD_TRANSFER_PRIORITY 98
-#endif
-
-/* Size of the transfer job queue (whole-frame jobs).  The algorithm only
- * issues one write at a time (single-flight shared bus), so this only needs
- * a couple of slots plus margin. */
-
-#define NYABULA_JOB_QUEUE_SIZE 8
+/* The transfer request is a single-slot mailbox, not a queue.  The BlankGated
+ * algorithm is strictly single-flight (xfer_busy gates it), so at any instant
+ * there is at most ONE whole-frame write pending (a ready slot) plus the one
+ * in flight on the bus.  A bounded multi-slot queue would never hold more than
+ * one element, so per the vsyncalg_plusplus reference (which has no such
+ * queue) we use exactly one slot.  The only cross-thread sync needed is a
+ * counting semaphore (job_avail) that wakes the transfer thread when a job is
+ * posted and lets it block (CPU-free) when idle.
+ */
 
 /****************************************************************************
  * Public Types
@@ -256,14 +251,17 @@ typedef struct nyabula_dual_lcd_s
   nyabula_te_t *te;
   bool running;
 
-  /* Write-job queue consumed by the transfer thread (bounded, strict FIFO). */
-  nyabula_write_job_t job_queue[NYABULA_JOB_QUEUE_SIZE];
-  int job_head;
-  int job_tail;
-  int job_count;
-  sem_t job_mutex; /* Guards the queue (binary mutex) */
-  sem_t job_avail; /* Count of queued jobs */
-  sem_t job_space; /* Count of free queue slots */
+  /* Single-slot write-job mailbox consumed by the transfer thread.  The
+   * BlankGated algorithm is single-flight (xfer_busy gates it), so at most
+   * one whole-frame write is pending at a time -- exactly the reference
+   * scheduler's "at most one ready" model, hence just ONE slot (no FIFO).
+   * job_mutex guards the single slot against the producer (TE/scheduler
+   * thread via request_write) and the consumer (transfer thread); job_avail
+   * is the counting semaphore that parks the transfer thread when idle and
+   * wakes it when a job arrives. */
+  nyabula_write_job_t job_slot;
+  sem_t job_mutex; /* Guards the single job slot (binary mutex) */
+  sem_t job_avail; /* Count of pending jobs (0/1 under single-flight) */
 
   /* Render-kick semaphore: wakes the render loop (run by the caller's
    * thread via nyabula_dual_lcd_task()) to consume TE-driven render

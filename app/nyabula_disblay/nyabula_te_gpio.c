@@ -106,38 +106,6 @@ struct nyabula_te_s
  * Private Functions
  ****************************************************************************/
 
-/* Create a thread with an explicit SCHED_FIFO priority (lower number =
- * higher priority in NuttX), so TE edges are consumed on time and are not
- * delayed by the render or transfer threads. */
-
-static int create_thread_prio(pthread_t *thr, void *(*fn)(void *), void *arg,
-                              int prio)
-{
-  pthread_attr_t attr;
-  struct sched_param param;
-  int ret;
-
-  pthread_attr_init(&attr);
-  param.sched_priority = prio;
-  ret = pthread_attr_setschedparam(&attr, &param);
-  if (ret != 0)
-    {
-      pthread_attr_destroy(&attr);
-      return ret;
-    }
-
-  ret = pthread_attr_setschedpolicy(&attr, SCHED_FIFO);
-  if (ret != 0)
-    {
-      pthread_attr_destroy(&attr);
-      return ret;
-    }
-
-  ret = pthread_create(thr, &attr, fn, arg);
-  pthread_attr_destroy(&attr);
-  return ret;
-}
-
 /* Read the current level of a screen's TE pin (GPIOC_READ).  Returns true
  * for HIGH (blanking) and false for LOW (scanning). */
 
@@ -292,7 +260,8 @@ nyabula_te_t *nyabula_te_init(struct nyabula_dual_lcd_s *dual,
 
   t->running = true;
 
-  ret = create_thread_prio(&t->thread, te_thread_func, t, NYABULA_TE_PRIORITY);
+  ret = nyabula_te_create_thread_prio(&t->thread, te_thread_func, t,
+                                      NYABULA_TE_PRIORITY);
   if (ret != 0)
     {
       t->running = false;

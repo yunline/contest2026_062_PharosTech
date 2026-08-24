@@ -48,6 +48,8 @@
 #ifndef __NYABULA_TE_H
 #define __NYABULA_TE_H
 
+#include <pthread.h>
+#include <sched.h>
 #include <stdbool.h>
 
 #ifdef __cplusplus
@@ -82,6 +84,44 @@ extern "C" {
 #ifndef NYABULA_TE_ACTIVE_US
 #define NYABULA_TE_ACTIVE_US 7500
 #endif
+
+/****************************************************************************
+ * Inline Functions
+ ****************************************************************************/
+
+/* Create a thread with an explicit SCHED_FIFO priority (NuttX: lower
+ * number = higher priority).  Shared by all TE sources so their edge
+ * threads run on time and are not delayed by the render or transfer
+ * threads.  Returns 0 on success, or a POSIX error number. */
+
+static inline int nyabula_te_create_thread_prio(pthread_t *thr,
+                                                void *(*fn)(void *), void *arg,
+                                                int prio)
+{
+  pthread_attr_t attr;
+  struct sched_param param;
+  int ret;
+
+  pthread_attr_init(&attr);
+  param.sched_priority = prio;
+  ret = pthread_attr_setschedparam(&attr, &param);
+  if (ret != 0)
+    {
+      pthread_attr_destroy(&attr);
+      return ret;
+    }
+
+  ret = pthread_attr_setschedpolicy(&attr, SCHED_FIFO);
+  if (ret != 0)
+    {
+      pthread_attr_destroy(&attr);
+      return ret;
+    }
+
+  ret = pthread_create(thr, &attr, fn, arg);
+  pthread_attr_destroy(&attr);
+  return ret;
+}
 
 /****************************************************************************
  * Public Types

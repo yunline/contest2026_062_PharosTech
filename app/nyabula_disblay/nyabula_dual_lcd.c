@@ -44,9 +44,10 @@
  *                     90-deg); when the panel TE pins are wired it becomes
  *                     a GPIO interrupt source.  High priority for correct
  *                     timing.
- *   - Transfer thread: pops whole-frame write jobs and issues a BLOCKING
- *                     LCDDEVIO_PUTAREA ioctl (QSPI DMA).  It does not
- *                     consume CPU while the DMA is in flight.
+ *   - Transfer thread: receives whole-frame write jobs from a single-slot
+ *                     mailbox and issues a BLOCKING LCDDEVIO_PUTAREA ioctl
+ *                     (QSPI DMA).  It does not consume CPU while the DMA is
+ *                     in flight.
  *
  * TE signal / polarity / state machine
  *   The panel controller cannot produce a falling edge exactly at line 180
@@ -135,10 +136,6 @@ static nyabula_dual_lcd_t *g_dual_active = NULL;
 static int32_t align_round_up(int32_t v, uint16_t align);
 static void rounder_cb(lv_event_t *e);
 
-/* Create a thread with an explicit FIFO priority (lower number = higher). */
-static int create_thread_prio(pthread_t *thr, void *(*fn)(void *), void *arg,
-                              int prio);
-
 /* TE edge callbacks (implemented by this framework, registered with the TE
  * source via nyabula_te_init). */
 static void te_scan_start_cb(nyabula_dual_lcd_t *dual, int sid);
@@ -150,10 +147,10 @@ static bool sch_request_write(struct nyabula_screen *scr, int slot);
 static void sch_on_buf_free(struct nyabula_screen *scr, int slot);
 static void sch_render_skip(struct nyabula_screen *scr, int slot);
 
-/* Job queue (strict FIFO, bounded). */
-static int job_enqueue(nyabula_dual_lcd_t *dual, const nyabula_write_job_t *j);
-static int job_dequeue_fair(nyabula_dual_lcd_t *dual,
-                            nyabula_write_job_t *out);
+/* Single-slot xfer write-job mailbox (producer -> transfer thread). */
+static int xfer_job_post(nyabula_dual_lcd_t *dual,
+                         const nyabula_write_job_t *j);
+static int xfer_job_take(nyabula_dual_lcd_t *dual, nyabula_write_job_t *out);
 
 /* Threads */
 static void *transfer_thread_func(void *arg);
@@ -295,15 +292,16 @@ static void sch_request_render(struct nyabula_screen *scr, int slot)
 }
 
 /* algorithm -> framework: request a whole-frame write of buffer `slot`.
- * Runs under the algorithm lock; enqueues a job for the transfer thread
- * (one blocking QSPI DMA for the entire frame).  Returns true if the job
- * was enqueued, false if the queue is full (job dropped). */
+ * Runs under the algorithm lock; posts the write job to the single-slot
+ * mailbox for the transfer thread (one blocking QSPI DMA for the entire
+ * frame).  Always succeeds under single-flight (the slot cannot be full);
+ * returns false only when the pipeline is shutting down, so the algorithm's
+ * roll-back path stays reachable during teardown. */
 
 static bool sch_request_write(struct nyabula_screen *scr, int slot)
 {
   nyabula_dual_lcd_t *dual;
   nyabula_write_job_t job;
-  int ret;
 
   dual = (nyabula_dual_lcd_t *)scr->dual;
   if (!dual || dual->quitting)
@@ -315,8 +313,8 @@ static bool sch_request_write(struct nyabula_screen *scr, int slot)
   job.screen_id = scr->screen_id;
   job.buf_idx = slot;
 
-  ret = job_enqueue(dual, &job);
-  return (ret == 0);
+  xfer_job_post(dual, &job);
+  return true;
 }
 
 /* algorithm -> framework: a slot's whole-frame write is fully done in GRAM;
@@ -442,90 +440,54 @@ static void te_blank_start_cb(nyabula_dual_lcd_t *dual, int sid)
 }
 
 /****************************************************************************
- * Job queue (bounded, guarded by job_mutex + job_avail/job_space counting
- * semaphores).
+ * Single-slot write-job mailbox (bounded by single-flight, not a FIFO).
+ *
+ * The BlankGated algorithm is strictly single-flight (xfer_busy), so at any
+ * instant at most ONE whole-frame write is waiting for the transfer thread
+ * plus the one in flight on the shared bus.  A multi-slot FIFO (as once
+ * existed here) could never hold more than one element -- it mirrored the
+ * simulator's discrete-event queue, which is not part of the reference
+ * scheduler (vsyncalg_plusplus/schedulers.py BlankGatedScheduler).  Per that
+ * reference the framework needs only ONE slot and a counting semaphore to
+ * hand the write job off to the transfer thread and park it when idle.
+ *
+ * Crossing threads:
+ *   - producer  : TE/scheduler thread -> request_write -> xfer_job_post
+ *   - consumer  : transfer thread     -> xfer_job_take -> blocking PUTAREA
+ *
+ * The slot crossover is safe under single-flight: the producer only ever
+ * posts a NEW job after the previous whole-frame write's xfer_done, by which
+ * time the consumer has already copied the prior job into its local variable
+ * and is DMA-ing it.  job_mutex (binary) still guards the single slot so the
+ * handoff stays correct even if single-flight is ever relaxed; job_avail
+ * (counting 0/1) parks/unparks the consumer without burning CPU.
  ****************************************************************************/
 
-static int job_enqueue(nyabula_dual_lcd_t *dual, const nyabula_write_job_t *j)
+static int xfer_job_post(nyabula_dual_lcd_t *dual,
+                         const nyabula_write_job_t *j)
 {
-  int ret = -EAGAIN;
-
-  if (sem_trywait(&dual->job_space) != 0)
-    {
-      /* Queue full; respect backpressure and drop the submission. */
-      return -EAGAIN;
-    }
-
   sem_wait(&dual->job_mutex);
-
-  dual->job_queue[dual->job_tail] = *j;
-  dual->job_tail = (dual->job_tail + 1) % NYABULA_JOB_QUEUE_SIZE;
-  dual->job_count++;
-  ret = 0;
-
+  dual->job_slot = *j;
   sem_post(&dual->job_mutex);
+
+  /* Wake the transfer thread: one pending xfer job.  Under single-flight
+   * this never overflows (the producer can't post a second job while the
+   * first is still in the slot), so job_avail stays 0/1. */
   sem_post(&dual->job_avail);
-
-  return ret;
-}
-
-static int job_dequeue_fair(nyabula_dual_lcd_t *dual, nyabula_write_job_t *out)
-{
-  /* Strict FIFO: the shared bus serves write jobs in submission order
-   * (first-come first-served), matching the physical reality of a single
-   * controller / single bus.  Fairness between screens is the ALGORITHM's
-   * job at submission time, not the framework's.  The old round-robin
-   * reorder here was a v6 leftover that violated this boundary. */
-  sem_wait(&dual->job_avail);
-  sem_wait(&dual->job_mutex);
-
-  *out = dual->job_queue[dual->job_head];
-  dual->job_head = (dual->job_head + 1) % NYABULA_JOB_QUEUE_SIZE;
-  dual->job_count--;
-  sem_post(&dual->job_mutex);
-  sem_post(&dual->job_space);
 
   return 0;
 }
 
-/****************************************************************************
- * Name: create_thread_prio
- *
- * Description:
- *   Create a pthread with an explicit SCHED_FIFO priority (lower number =
- *   higher priority in NuttX).  Used for the transfer thread (which sits
- *   below the TE source so TE edges win, but above the caller-hosted render
- *   loop so the DMA keeps the bus busy).  The TE source threads are created
- *   in the same way inside the TE module (nyabula_te_*.c).
- *
- ****************************************************************************/
-
-static int create_thread_prio(pthread_t *thr, void *(*fn)(void *), void *arg,
-                              int prio)
+static int xfer_job_take(nyabula_dual_lcd_t *dual, nyabula_write_job_t *out)
 {
-  pthread_attr_t attr;
-  struct sched_param param;
-  int ret;
+  /* Block (CPU-free) until a xfer job is posted; consuming it clears the
+   * 0/1 count so the slot may be safely overwritten by the next post. */
+  sem_wait(&dual->job_avail);
+  sem_wait(&dual->job_mutex);
+  *out = dual->job_slot;
+  sem_post(&dual->job_mutex);
 
-  pthread_attr_init(&attr);
-  param.sched_priority = prio;
-  ret = pthread_attr_setschedparam(&attr, &param);
-  if (ret != 0)
-    {
-      pthread_attr_destroy(&attr);
-      return ret;
-    }
-
-  ret = pthread_attr_setschedpolicy(&attr, SCHED_FIFO);
-  if (ret != 0)
-    {
-      pthread_attr_destroy(&attr);
-      return ret;
-    }
-
-  ret = pthread_create(thr, &attr, fn, arg);
-  pthread_attr_destroy(&attr);
-  return ret;
+  return 0;
 }
 
 /****************************************************************************
@@ -659,12 +621,12 @@ void nyabula_dual_lcd_task(nyabula_dual_lcd_t *dual)
  * Name: transfer_thread_func
  *
  * Description:
- *   Transfer thread.  Pops whole-frame write jobs from the job queue and
- *   issues a BLOCKING LCDDEVIO_PUTAREA ioctl (QSPI DMA) for each -- the
- *   call blocks until the DMA completes but does not consume CPU meanwhile.
- *   The shared bus serves jobs strictly in submission order (FIFO); fairness
- *   between screens is the ALGORITHM's job at submission time, not the
- *   framework's.
+ *   Transfer thread.  Waits on the single-slot write mailbox (job_avail) and
+ *   issues a BLOCKING LCDDEVIO_PUTAREA ioctl (QSPI DMA) for each whole-frame
+ *   job -- the call blocks until the DMA completes but does not consume CPU
+ *   meanwhile.  Fairness between screens is the ALGORITHM's job at submission
+ *   time (it picks which screen's ready slot to write when the bus is free);
+ *   the framework's mailbox is a strict handoff, not a reorder point.
  *
  *   After each whole-frame write completes, the edge is reported to the
  *   BlankGated algorithm (nyabula_sch_bg_on_xfer_done), which releases the
@@ -684,7 +646,7 @@ static void *transfer_thread_func(void *arg)
 
   while (dual->running)
     {
-      job_dequeue_fair(dual, &job);
+      xfer_job_take(dual, &job);
 
       if (!dual->running)
         {
@@ -1199,13 +1161,9 @@ nyabula_dual_lcd_t *nyabula_dual_lcd_create(const char *dev_path0,
 
   dual->running = false;
   dual->te = NULL;
-  dual->job_head = 0;
-  dual->job_tail = 0;
-  dual->job_count = 0;
 
   sem_init(&dual->job_mutex, 0, 1);
   sem_init(&dual->job_avail, 0, 0);
-  sem_init(&dual->job_space, 0, NYABULA_JOB_QUEUE_SIZE);
   sem_init(&dual->render_kick, 0, 0);
 
   /* Initialize screen 0 */
@@ -1225,8 +1183,8 @@ nyabula_dual_lcd_t *nyabula_dual_lcd_create(const char *dev_path0,
     }
 
   /* Wire the BlankGated algorithm: register its request callbacks and set
-   * the screen back-pointers so its write request can reach the job queue.
-   * The algorithm only ever sees the opaque screen handles and these
+   * the screen back-pointers so its write request can reach the transfer
+   * mailbox.  The algorithm only ever sees the opaque screen handles and these
    * callbacks -- no LVGL/DMA detail. */
   sch_cb.request_render = sch_request_render;
   sch_cb.request_write = sch_request_write;
@@ -1261,10 +1219,11 @@ nyabula_dual_lcd_t *nyabula_dual_lcd_create(const char *dev_path0,
       goto err_te_thread;
     }
 
-  /* Start the transfer (QSPI DMA) thread at a priority below the TE source
-   * (so TE wins) but above the render/main thread (so DMA keeps busy). */
-  ret = create_thread_prio(&dual->transfer_thread, transfer_thread_func, dual,
-                           NYABULA_DUAL_LCD_TRANSFER_PRIORITY);
+  /* Start the transfer (QSPI DMA) thread.  It blocks on the single-slot
+   * mailbox while idle, so it needs no special priority (the TE source
+   * still runs its own higher-priority thread -- see nyabula_te_*.c). */
+  ret =
+      pthread_create(&dual->transfer_thread, NULL, transfer_thread_func, dual);
   if (ret != 0)
     {
       LV_LOG_ERROR("Failed to create transfer thread: %d", ret);
@@ -1291,7 +1250,6 @@ err_screen1:
 err_screen0:
   sem_destroy(&dual->job_mutex);
   sem_destroy(&dual->job_avail);
-  sem_destroy(&dual->job_space);
   sem_destroy(&dual->render_kick);
   lv_free(dual);
   g_dual_active = NULL; /* release the singleton on failure so it can retry */
@@ -1332,7 +1290,6 @@ void nyabula_dual_lcd_destroy(nyabula_dual_lcd_t *dual)
 
   sem_destroy(&dual->job_mutex);
   sem_destroy(&dual->job_avail);
-  sem_destroy(&dual->job_space);
   sem_destroy(&dual->render_kick);
 
   lv_free(dual);
