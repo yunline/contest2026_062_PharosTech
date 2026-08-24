@@ -3,7 +3,7 @@
  *
  * Dual-screen dual-buffer LVGL interface layered on the "BlankGated" frame
  * scheduler (an in-house dual-panel scheduling algorithm; its C port lives
- * in nyabula_blankgated_scheduler.c).
+ * in nyabula_scheduler_blankgated.c).
  *
  * Licensed to the Apache Software Foundation (ASF) under one or more
  * contributor license agreements.  See the NOTICE file distributed with
@@ -29,9 +29,9 @@
  * instant only one screen can be written.  This layer is the FRAMEWORK:
  * it owns the threads, the LVGL integration and the DMA (PUTAREA) device
  * access, and passes all *scheduling decisions* to the BlankGated algorithm
- * (nyabula_blankgated_scheduler.c).  Framework and algorithm are fully
+ * (nyabula_scheduler_blankgated.c).  Framework and algorithm are fully
  * decoupled: the algorithm only consumes the four edge callbacks/requests
- * declared in nyabula_blankgated_scheduler.h and knows nothing about LVGL
+ * declared in nyabula_scheduler_blankgated.h and knows nothing about LVGL
  * or DMA.
  *
  * Thread model
@@ -64,7 +64,7 @@
  *   from interrupt context; the GPIO TE source defers to a thread (see
  *   nyabula_te_gpio.c).
  *
- * Framework <-> algorithm interface (see nyabula_blankgated_scheduler.h):
+ * Framework <-> algorithm interface (see nyabula_scheduler_blankgated.h):
  *   framework -> algorithm : on_scan_start / on_blank_start / on_render_done
  *                            / on_xfer_done
  *   algorithm -> framework : request_render / request_write / on_buf_free
@@ -145,10 +145,10 @@ static void te_scan_start_cb(nyabula_dual_lcd_t *dual, int sid);
 static void te_blank_start_cb(nyabula_dual_lcd_t *dual, int sid);
 
 /* BlankGated request callbacks (algorithm -> framework). */
-static void bg_request_render(struct nyabula_screen *scr, int slot);
-static bool bg_request_write(struct nyabula_screen *scr, int slot);
-static void bg_on_buf_free(struct nyabula_screen *scr, int slot);
-static void bg_render_skip(struct nyabula_screen *scr, int slot);
+static void sch_request_render(struct nyabula_screen *scr, int slot);
+static bool sch_request_write(struct nyabula_screen *scr, int slot);
+static void sch_on_buf_free(struct nyabula_screen *scr, int slot);
+static void sch_render_skip(struct nyabula_screen *scr, int slot);
 
 /* Job queue (strict FIFO, bounded). */
 static int job_enqueue(nyabula_dual_lcd_t *dual, const nyabula_write_job_t *j);
@@ -279,7 +279,7 @@ static void te_refr_req_cb(lv_event_t *e)
  * LVGL to draw into `slot` (via lv_display_set_draw_buffers) before the
  * actual lv_refr_now() on the caller's thread in nyabula_dual_lcd_task(). */
 
-static void bg_request_render(struct nyabula_screen *scr, int slot)
+static void sch_request_render(struct nyabula_screen *scr, int slot)
 {
   if (!scr->initialized)
     {
@@ -299,7 +299,7 @@ static void bg_request_render(struct nyabula_screen *scr, int slot)
  * (one blocking QSPI DMA for the entire frame).  Returns true if the job
  * was enqueued, false if the queue is full (job dropped). */
 
-static bool bg_request_write(struct nyabula_screen *scr, int slot)
+static bool sch_request_write(struct nyabula_screen *scr, int slot)
 {
   nyabula_dual_lcd_t *dual;
   nyabula_write_job_t job;
@@ -323,7 +323,7 @@ static bool bg_request_write(struct nyabula_screen *scr, int slot)
  * its offscreen buffer is free for LVGL to reuse.  Post buf_free so a blocked
  * flush_wait_cb (or the render defer wait) can proceed. */
 
-static void bg_on_buf_free(struct nyabula_screen *scr, int slot)
+static void sch_on_buf_free(struct nyabula_screen *scr, int slot)
 {
   if (!scr->initialized)
     {
@@ -345,14 +345,14 @@ static void bg_on_buf_free(struct nyabula_screen *scr, int slot)
  * shows the latest frame, so the slot is simply released -- the algorithm
  * clears rendering_slot without marking the slot readied for a write. */
 
-static void bg_render_skip(struct nyabula_screen *scr, int slot)
+static void sch_render_skip(struct nyabula_screen *scr, int slot)
 {
   if (!scr->initialized)
     {
       return;
     }
 
-  nyabula_bg_on_render_skip(&scr->dual->bg, scr->screen_id, slot);
+  nyabula_sch_bg_on_render_skip(&scr->dual->sch, scr->screen_id, slot);
 }
 
 /* LVGL event handler: this display actually redrew a frame (it had at least
@@ -404,10 +404,10 @@ static void te_scan_start_cb(nyabula_dual_lcd_t *dual, int sid)
       return;
     }
 
-  nyabula_bg_on_scan_start(&dual->bg, sid);
+  nyabula_sch_bg_on_scan_start(&dual->sch, sid);
 
   /* Wake the render loop once per frame so the pending render request
-   * (posted by bg_request_render via the algorithm) is consumed promptly at
+   * (posted by sch_request_render via the algorithm) is consumed promptly at
    * the frame boundary. */
   sem_post(&dual->render_kick);
 }
@@ -438,7 +438,7 @@ static void te_blank_start_cb(nyabula_dual_lcd_t *dual, int sid)
       return;
     }
 
-  nyabula_bg_on_blank_start(&dual->bg, sid);
+  nyabula_sch_bg_on_blank_start(&dual->sch, sid);
 }
 
 /****************************************************************************
@@ -629,7 +629,7 @@ void nyabula_dual_lcd_task(nyabula_dual_lcd_t *dual)
           lv_refr_now(scr->disp);
           if (!scr->lvgl_rendered)
             {
-              bg_render_skip(scr, slot);
+              sch_render_skip(scr, slot);
             }
         }
     }
@@ -667,7 +667,7 @@ void nyabula_dual_lcd_task(nyabula_dual_lcd_t *dual)
  *   framework's.
  *
  *   After each whole-frame write completes, the edge is reported to the
- *   BlankGated algorithm (nyabula_bg_on_xfer_done), which releases the
+ *   BlankGated algorithm (nyabula_sch_bg_on_xfer_done), which releases the
  *   single-flight bus and frees the slot's double buffer.
  *
  ****************************************************************************/
@@ -727,7 +727,7 @@ static void *transfer_thread_func(void *arg)
        * double buffer.  The DMA hardware gives us exactly one interrupt per
        * submitted write, which is the physical signal the algorithm keys its
        * bookkeeping on. */
-      nyabula_bg_on_xfer_done(&dual->bg, job.screen_id, job.buf_idx);
+      nyabula_sch_bg_on_xfer_done(&dual->sch, job.screen_id, job.buf_idx);
     }
 
   return NULL;
@@ -830,7 +830,7 @@ static void flush_cb(lv_display_t *disp, const lv_area_t *area,
   /* Content is ready: the algorithm moves buf_idx from "rendering" to
    * "ready".  Called outside st_mutex (the algorithm takes its own lock).
    */
-  nyabula_bg_on_render_done(&scr->dual->bg, scr->screen_id, buf_idx);
+  nyabula_sch_bg_on_render_done(&scr->dual->sch, scr->screen_id, buf_idx);
 
   /* Release this buffer so LVGL resumes rendering into the other one. */
   lv_display_flush_ready(disp);
@@ -1158,7 +1158,7 @@ nyabula_dual_lcd_t *nyabula_dual_lcd_create(const char *dev_path0,
                                             int height)
 {
   nyabula_dual_lcd_t *dual;
-  nyabula_bg_callbacks_t bg_cb;
+  nyabula_sch_bg_callbacks_t sch_cb;
   int sid;
   int ret;
 
@@ -1228,17 +1228,17 @@ nyabula_dual_lcd_t *nyabula_dual_lcd_create(const char *dev_path0,
    * the screen back-pointers so its write request can reach the job queue.
    * The algorithm only ever sees the opaque screen handles and these
    * callbacks -- no LVGL/DMA detail. */
-  bg_cb.request_render = bg_request_render;
-  bg_cb.request_write = bg_request_write;
-  bg_cb.on_buf_free = bg_on_buf_free;
-  bg_cb.on_render_skip = bg_render_skip;
+  sch_cb.request_render = sch_request_render;
+  sch_cb.request_write = sch_request_write;
+  sch_cb.on_buf_free = sch_on_buf_free;
+  sch_cb.on_render_skip = sch_render_skip;
 
-  nyabula_bg_init(&dual->bg, &bg_cb);
+  nyabula_sch_bg_init(&dual->sch, &sch_cb);
 
   for (sid = 0; sid < NYABULA_DUAL_LCD_MAX_SCREENS; sid++)
     {
       dual->screen[sid].dual = dual;
-      dual->bg.screen[sid] = &dual->screen[sid];
+      dual->sch.screen[sid] = &dual->screen[sid];
     }
 
   dual->running = true;

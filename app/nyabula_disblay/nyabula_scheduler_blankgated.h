@@ -1,5 +1,5 @@
 /****************************************************************************
- * apps/graphics/nyabula_display/nyabula_blankgated_scheduler.h
+ * apps/graphics/nyabula_display/nyabula_scheduler_blankgated.h
  *
  * "BlankGated" scheduler: algorithm layer for the dual-panel shared-write-bus
  * tearing problem, ported from the vsyncalg_plusplus Python reference
@@ -22,8 +22,8 @@
  *
  ****************************************************************************/
 
-#ifndef __NYABULA_BLANKGATED_SCHEDULER_H
-#define __NYABULA_BLANKGATED_SCHEDULER_H
+#ifndef __NYABULA_SCHEDULER_BLANKGATED_H
+#define __NYABULA_SCHEDULER_BLANKGATED_H
 
 /****************************************************************************
  * Design notes
@@ -89,7 +89,7 @@ extern "C" {
  * Pre-processor Definitions
  ****************************************************************************/
 
-#define NYABULA_BG_MAX_SCREENS 2
+#define NYABULA_SCH_BG_MAX_SCREENS 2
 
 /****************************************************************************
  * Public Types
@@ -134,32 +134,32 @@ typedef struct
   void (*on_render_skip)(struct nyabula_screen *screen, int slot);
 
   /* Optional: a render request was deferred/dropped because the
-   * double-buffer was full (bg_can_render failed).  The framework only uses
-   * this to count drops for profiling (nyabula_display_audit); it must not
-   * change its behaviour.  May be NULL. */
+   * double-buffer was full (sch_bg_can_render failed).  The framework only
+   * uses this to count drops for profiling (nyabula_display_audit); it must
+   * not change its behaviour.  May be NULL. */
   void (*on_render_drop)(struct nyabula_screen *screen);
-} nyabula_bg_callbacks_t;
+} nyabula_sch_bg_callbacks_t;
 
 /* BlankGated algorithm context (one per dual-LCD context, shared by both
  * screens so the shared-bus single-flight is coordinated here). */
 
-typedef struct nyabula_bg_s
+typedef struct nyabula_sch_bg_s
 {
   /* Per-screen ledger.  Each screen owns two offscreen buffers (slots 0 and
    * 1); a slot lives in exactly one of the three states below (or is free).
    * -1 = no slot in that state.  This mirrors the reference
    * BlankGatedScheduler's render[s]/ready[s]/xfer[s] slot indices. */
-  int rendering_slot[NYABULA_BG_MAX_SCREENS];
-  int ready_slot[NYABULA_BG_MAX_SCREENS];
-  int xfer_slot[NYABULA_BG_MAX_SCREENS];
+  int rendering_slot[NYABULA_SCH_BG_MAX_SCREENS];
+  int ready_slot[NYABULA_SCH_BG_MAX_SCREENS];
+  int xfer_slot[NYABULA_SCH_BG_MAX_SCREENS];
 
   /* Per-screen slot rotation preference (mirrors next_slot[s] in the
    * reference): the first slot to try when picking a free buffer. */
-  int next_slot[NYABULA_BG_MAX_SCREENS];
+  int next_slot[NYABULA_SCH_BG_MAX_SCREENS];
 
   /* Per-screen: inside the blanking window / wants a new frame. */
-  bool in_blanking[NYABULA_BG_MAX_SCREENS];
-  bool want[NYABULA_BG_MAX_SCREENS];
+  bool in_blanking[NYABULA_SCH_BG_MAX_SCREENS];
+  bool want[NYABULA_SCH_BG_MAX_SCREENS];
 
   /* Shared-bus single-flight: a whole-frame write is currently in flight
    * (across both screens). */
@@ -173,11 +173,11 @@ typedef struct nyabula_bg_s
   sem_t lock;
 
   /* Screen back-pointers (set by the framework at create time). */
-  struct nyabula_screen *screen[NYABULA_BG_MAX_SCREENS];
+  struct nyabula_screen *screen[NYABULA_SCH_BG_MAX_SCREENS];
 
   /* Framework-registered request callbacks. */
-  nyabula_bg_callbacks_t cb;
-} nyabula_bg_t;
+  nyabula_sch_bg_callbacks_t cb;
+} nyabula_sch_bg_t;
 
 /****************************************************************************
  * Public Function Prototypes
@@ -185,29 +185,32 @@ typedef struct nyabula_bg_s
 
 /* Initialize the algorithm context (bind the request callbacks).  The
  * screen[] back-pointers must be set by the framework afterwards. */
-void nyabula_bg_init(nyabula_bg_t *bg, const nyabula_bg_callbacks_t *cb);
+void nyabula_sch_bg_init(nyabula_sch_bg_t *sch_bg,
+                         const nyabula_sch_bg_callbacks_t *cb);
 
 /* framework -> algorithm: TE falling edge (blanking ended, a new frame scan
  * begins): clear in_blanking, request a new frame. */
-void nyabula_bg_on_scan_start(nyabula_bg_t *bg, int sid);
+void nyabula_sch_bg_on_scan_start(nyabula_sch_bg_t *sch_bg, int sid);
 
 /* framework -> algorithm: TE rising edge (scanning finished, blanking
  * begins): set in_blanking and try to start a whole-frame write. */
-void nyabula_bg_on_blank_start(nyabula_bg_t *bg, int sid);
+void nyabula_sch_bg_on_blank_start(nyabula_sch_bg_t *sch_bg, int sid);
 
 /* framework -> algorithm: render into `slot` completed, content is ready. */
-void nyabula_bg_on_render_done(nyabula_bg_t *bg, int sid, int slot);
+void nyabula_sch_bg_on_render_done(nyabula_sch_bg_t *sch_bg, int sid,
+                                   int slot);
 
 /* framework -> algorithm: a requested render of `slot` was skipped by LVGL
  * (no invalid areas, static frame).  The slot is NOT marked ready (no write
  * needed); rendering_slot is cleared so the pipeline keeps rotating. */
-void nyabula_bg_on_render_skip(nyabula_bg_t *bg, int sid, int slot);
+void nyabula_sch_bg_on_render_skip(nyabula_sch_bg_t *sch_bg, int sid,
+                                   int slot);
 
 /* framework -> algorithm: the whole-frame write of `slot` completed. */
-void nyabula_bg_on_xfer_done(nyabula_bg_t *bg, int sid, int slot);
+void nyabula_sch_bg_on_xfer_done(nyabula_sch_bg_t *sch_bg, int sid, int slot);
 
 #ifdef __cplusplus
 }
 #endif
 
-#endif /* __NYABULA_BLANKGATED_SCHEDULER_H */
+#endif /* __NYABULA_SCHEDULER_BLANKGATED_H */

@@ -56,7 +56,7 @@
 
 /* BlankGated algorithm layer: framework and scheduler are decoupled; the
  * algorithm issues render/write requests via the registered callbacks. */
-#include "nyabula_blankgated_scheduler.h"
+#include "nyabula_scheduler_blankgated.h"
 
 /* TE edge source abstraction (software frame clock now, panel TE GPIO
  * interrupt later; selected by CONFIG_NYABULA_DISPLAY_TE_SOURCE). */
@@ -148,8 +148,8 @@ typedef struct
 struct nyabula_dual_lcd_s;
 
 /* Per-screen state and LVGL handle.  The scheduling state lives in the
- * shared nyabula_bg_t in the dual context (see
- * nyabula_blankgated_scheduler.h); this struct holds only the framework-side
+ * shared nyabula_sch_bg_t in the dual context (see
+ * nyabula_scheduler_blankgated.h); this struct holds only the framework-side
  * resources (device, LVGL display, buffers, sync).
  *
  * The tag "nyabula_screen" matches the opaque forward-declaration used by
@@ -181,7 +181,7 @@ struct nyabula_screen
   lv_draw_buf_t draw_buf[2];
 
   /* The slot the algorithm has selected for the next render (0/1, or -1 if
-   * none pending).  Written by bg_request_render under st_mutex; consumed by
+   * none pending).  Written by sch_request_render under st_mutex; consumed by
    * the render loop to point LVGL at the right buffer before lv_refr_now(). */
   int pending_slot;
 
@@ -240,9 +240,11 @@ typedef struct nyabula_dual_lcd_s
 {
   nyabula_screen_t screen[NYABULA_DUAL_LCD_MAX_SCREENS];
 
-  /* BlankGated scheduling algorithm context (shared by both screens so the
-   * single shared-bus write is arbitrated here). */
-  nyabula_bg_t bg;
+  /* Scheduling algorithm context (shared by both screens so the single
+   * shared-bus write is arbitrated here).  Prefixed `sch` rather than the
+   * concrete algorithm name so swapping in a different scheduler does not
+   * force a rename of the framework's integration point. */
+  nyabula_sch_bg_t sch;
 
   /* Transfer thread: blocking QSPI DMA, one whole-frame at a time. */
   pthread_t transfer_thread;

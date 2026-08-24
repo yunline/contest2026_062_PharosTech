@@ -24,7 +24,7 @@ if(CONFIG_GRAPHICS_NYABULA_DISPLAY)
       main.c
       nyabula_display.c
       nyabula_dual_lcd.c
-      nyabula_blankgated_scheduler.c
+      nyabula_scheduler_blankgated.c
       nyabula_dual_demo.c)
 
   if(CONFIG_NYABULA_DISPLAY_TE_SW)

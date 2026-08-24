@@ -28,7 +28,7 @@ STACKSIZE = $(CONFIG_NYABULA_DISPLAY_STACKSIZE)
 MODULE = $(CONFIG_GRAPHICS_NYABULA_DISPLAY)
 
 MAINSRC = main.c
-CSRCS = nyabula_display.c nyabula_dual_lcd.c nyabula_blankgated_scheduler.c nyabula_dual_demo.c
+CSRCS = nyabula_display.c nyabula_dual_lcd.c nyabula_scheduler_blankgated.c nyabula_dual_demo.c
 
 ifeq ($(CONFIG_NYABULA_DISPLAY_TE_SW),y)
 CSRCS += nyabula_te_sw.c
