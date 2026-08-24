@@ -74,10 +74,9 @@ static int bg_free_slot(const nyabula_bg_t *bg, int sid)
   int slot;
 
   /* Try preferred slot first, then the alternate. */
-  for (slot = prefer; ; slot = 1 - slot)
+  for (slot = prefer;; slot = 1 - slot)
     {
-      if (slot != bg->rendering_slot[sid] &&
-          slot != bg->ready_slot[sid]     &&
+      if (slot != bg->rendering_slot[sid] && slot != bg->ready_slot[sid] &&
           slot != bg->xfer_slot[sid])
         {
           return slot;
@@ -258,6 +257,31 @@ void nyabula_bg_on_render_done(nyabula_bg_t *bg, int sid, int slot)
   bg->ready_slot[sid] = slot;
 
   bg_try_start_xfer(bg);
+  bg_try_start_render(bg, sid);
+
+  sem_post(&bg->lock);
+}
+
+/* ------------------------------------------------------------------
+ * Render skipped: the algorithm requested a render of `slot`, but LVGL had
+ * no invalid area and skipped the draw entirely (static frame).  The slot is
+ * NOT marked ready -- the panel GRAM already holds the latest content, so
+ * no write is needed.  Only clearing rendering_slot keeps the pipeline
+ * rotating without a needless GRAM write.
+ * ------------------------------------------------------------------ */
+
+void nyabula_bg_on_render_skip(nyabula_bg_t *bg, int sid, int slot)
+{
+  sem_wait(&bg->lock);
+
+  if (bg->rendering_slot[sid] == slot)
+    {
+      bg->rendering_slot[sid] = -1;
+    }
+
+  /* Deliberately do NOT set ready_slot: nothing new was rendered, so there
+   * is nothing to write out.  GRAM already shows the latest frame. */
+
   bg_try_start_render(bg, sid);
 
   sem_post(&bg->lock);

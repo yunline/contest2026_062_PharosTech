@@ -148,6 +148,7 @@ static void te_blank_start_cb(nyabula_dual_lcd_t *dual, int sid);
 static void bg_request_render(struct nyabula_screen *scr, int slot);
 static bool bg_request_write(struct nyabula_screen *scr, int slot);
 static void bg_on_buf_free(struct nyabula_screen *scr, int slot);
+static void bg_render_skip(struct nyabula_screen *scr, int slot);
 
 /* Job queue (strict FIFO, bounded). */
 static int job_enqueue(nyabula_dual_lcd_t *dual, const nyabula_write_job_t *j);
@@ -337,6 +338,43 @@ static void bg_on_buf_free(struct nyabula_screen *scr, int slot)
   sem_post(&scr->st_mutex);
 
   sem_post(&scr->buf_free);
+}
+
+/* algorithm -> framework: a requested render of `slot` was skipped by LVGL
+ * (no invalid area, static frame).  The content did not change and GRAM still
+ * shows the latest frame, so the slot is simply released -- the algorithm
+ * clears rendering_slot without marking the slot readied for a write. */
+
+static void bg_render_skip(struct nyabula_screen *scr, int slot)
+{
+  if (!scr->initialized)
+    {
+      return;
+    }
+
+  nyabula_bg_on_render_skip(&scr->dual->bg, scr->screen_id, slot);
+}
+
+/* LVGL event handler: this display actually redrew a frame (it had at least
+ * one invalid area) during the render loop's lv_refr_now().  This event is
+ * only fired when inv_p != 0, so its absence right after lv_refr_now() on the
+ * same thread means LVGL skipped the draw (static frame).  Same thread as the
+ * render loop, so no locking is needed for the flag. */
+
+static void render_ready_cb(lv_event_t *e)
+{
+  nyabula_screen_t *scr;
+
+  if (lv_event_get_code(e) != LV_EVENT_RENDER_READY)
+    {
+      return;
+    }
+
+  scr = lv_display_get_driver_data(lv_event_get_current_target(e));
+  if (scr != NULL)
+    {
+      scr->lvgl_rendered = true;
+    }
 }
 
 /****************************************************************************
@@ -577,7 +615,22 @@ void nyabula_dual_lcd_task(nyabula_dual_lcd_t *dual)
                                           &scr->draw_buf[0]);
             }
 
+          /* Clear the "rendered" flag, then run one synchronous LVGL frame.
+           * LV_EVENT_RENDER_READY only fires when the display actually
+           * redrew (inv_p != 0); if the flag is still false afterwards LVGL
+           * had no invalid area and skipped the draw (static frame).  In
+           * that case there is no flush_cb -> on_render_done, so the
+           * requested rendering_slot must be released explicitly via
+           * on_render_skip (which does NOT mark the slot ready -- GRAM
+           * already holds the latest frame, so no write is issued).  This
+           * both prevents the rendering_slot leak that froze one screen and
+           * lets static frames avoid needless redraws/writes. */
+          scr->lvgl_rendered = false;
           lv_refr_now(scr->disp);
+          if (!scr->lvgl_rendered)
+            {
+              bg_render_skip(scr, slot);
+            }
         }
     }
 
@@ -1008,6 +1061,8 @@ static int screen_init(nyabula_screen_t *scr, int sid, const char *dev_path,
                           scr);
   lv_display_add_event_cb(scr->disp, te_refr_req_cb, LV_EVENT_REFR_REQUEST,
                           scr);
+  lv_display_add_event_cb(scr->disp, render_ready_cb, LV_EVENT_RENDER_READY,
+                          scr);
   lv_display_add_event_cb(scr->disp, display_release_cb, LV_EVENT_DELETE,
                           scr->disp);
 
@@ -1176,6 +1231,7 @@ nyabula_dual_lcd_t *nyabula_dual_lcd_create(const char *dev_path0,
   bg_cb.request_render = bg_request_render;
   bg_cb.request_write = bg_request_write;
   bg_cb.on_buf_free = bg_on_buf_free;
+  bg_cb.on_render_skip = bg_render_skip;
 
   nyabula_bg_init(&dual->bg, &bg_cb);
 

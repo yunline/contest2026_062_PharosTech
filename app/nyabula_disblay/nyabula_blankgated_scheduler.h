@@ -125,6 +125,14 @@ typedef struct
    * free for LVGL reuse. */
   void (*on_buf_free)(struct nyabula_screen *screen, int slot);
 
+  /* The algorithm requested a render of `slot`, but LVGL ended up having
+   * no invalid areas and skipped the draw entirely (static frame).  The
+   * framework must simply release the requested slot WITHOUT marking it
+   * ready: the panel GRAM already holds the latest content, so no write is
+   * needed.  The algorithm clears rendering_slot so the pipeline keeps
+   * rotating. */
+  void (*on_render_skip)(struct nyabula_screen *screen, int slot);
+
   /* Optional: a render request was deferred/dropped because the
    * double-buffer was full (bg_can_render failed).  The framework only uses
    * this to count drops for profiling (nyabula_display_audit); it must not
@@ -189,6 +197,11 @@ void nyabula_bg_on_blank_start(nyabula_bg_t *bg, int sid);
 
 /* framework -> algorithm: render into `slot` completed, content is ready. */
 void nyabula_bg_on_render_done(nyabula_bg_t *bg, int sid, int slot);
+
+/* framework -> algorithm: a requested render of `slot` was skipped by LVGL
+ * (no invalid areas, static frame).  The slot is NOT marked ready (no write
+ * needed); rendering_slot is cleared so the pipeline keeps rotating. */
+void nyabula_bg_on_render_skip(nyabula_bg_t *bg, int sid, int slot);
 
 /* framework -> algorithm: the whole-frame write of `slot` completed. */
 void nyabula_bg_on_xfer_done(nyabula_bg_t *bg, int sid, int slot);

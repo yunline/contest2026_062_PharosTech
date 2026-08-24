@@ -138,7 +138,7 @@ extern "C" {
 typedef struct
 {
   uint8_t *data; /* Buffer base address (buf_size bytes) */
-  bool busy;     /* true = occupied (rendered / awaiting write); false = free */
+  bool busy; /* true = occupied (rendered / awaiting write); false = free */
 } nyabula_buf_t;
 
 /* Forward declaration: each screen holds a back-pointer to its owning dual
@@ -196,6 +196,14 @@ struct nyabula_screen
    * one lv_refr_now() for this screen at the frame boundary.  Guarded by
    * st_mutex. */
   bool render_request;
+
+  /* Set by the LV_EVENT_RENDER_READY handler when this display actually
+   * redrew (i.e. it had at least one invalid area).  The render loop clears
+   * it before calling lv_refr_now() and reads it afterwards: if it is still
+   * false, LVGL skipped the draw entirely (static frame) and the requested
+   * slot must be released via on_render_skip instead of on_render_done.
+   * Same thread as lv_refr_now() (the render loop), so no lock needed. */
+  bool lvgl_rendered;
 
   /* Serializes access to this screen's scheduler state shared between the
    * TE thread, the transfer thread and the render thread (flush_cb).
