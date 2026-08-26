@@ -266,60 +266,54 @@ static int rk3576_timer_interrupt(int irq, FAR void *context, FAR void *arg)
   cbarg = priv->arg;
   gen = priv->gen;
 
-  if (callback != NULL)
+  if (callback == NULL)
     {
-      spin_unlock_irqrestore(&priv->lock, flags);
+      /* No upper-half handler registered: nothing to notify, the channel
+       * simply expired and is now stopped.  Fall through to the common
+       * unlock/return.
+       */
 
-      if (callback(&next_interval, cbarg))
-        {
-          /* Periodic: reload with the (possibly updated) interval and
-           * restart the down-counter.  Re-arm only if no ioctl changed the
-           * running state while the callback ran with the lock dropped;
-           * otherwise a TCIOC_STOP issued during the callback would be
-           * silently undone.
-           */
-
-          flags = spin_lock_irqsave(&priv->lock);
-          if (priv->gen == gen)
-            {
-              if (next_interval > 0)
-                {
-                  rk3576_timer_settimeout_locked(priv, next_interval);
-                }
-
-              rk3576_timer_start_locked(priv);
-            }
-          else
-            {
-              /* State changed (e.g. STOP) during the callback: leave the
-               * channel exactly as the ioctl set it.
-               */
-
-              priv->started = false;
-            }
-        }
-      else
-        {
-          flags = spin_lock_irqsave(&priv->lock);
-
-          /* One-shot: the channel has expired.  Only mark it stopped if
-           * the state did not change during the callback; a TCIOC_START
-           * issued meanwhile has already re-enabled the hardware.
-           */
-
-          if (priv->gen == gen)
-            {
-              priv->started = false;
-            }
-        }
-
-      spin_unlock_irqrestore(&priv->lock, flags);
-    }
-  else
-    {
       priv->started = false;
       spin_unlock_irqrestore(&priv->lock, flags);
+      return OK;
     }
+
+  spin_unlock_irqrestore(&priv->lock, flags);
+
+  if (callback(&next_interval, cbarg))
+    {
+      /* Periodic: reload with the (possibly updated) interval and restart
+       * the down-counter.  Re-arm only if no ioctl changed the running
+       * state while the callback ran with the lock dropped; otherwise leave
+       * the channel exactly as the ioctl set it.
+       */
+
+      flags = spin_lock_irqsave(&priv->lock);
+      if (priv->gen == gen)
+        {
+          if (next_interval > 0)
+            {
+              rk3576_timer_settimeout_locked(priv, next_interval);
+            }
+
+          rk3576_timer_start_locked(priv);
+        }
+      spin_unlock_irqrestore(&priv->lock, flags);
+      return OK;
+    }
+
+  /* One-shot: the channel has expired.  Only mark it stopped if the
+   * state did not change during the callback; a concurrent TCIOC_START
+   * has already re-enabled the hardware, so leave priv->started as the
+   * ioctl set it.
+   */
+
+  flags = spin_lock_irqsave(&priv->lock);
+  if (priv->gen == gen)
+    {
+      priv->started = false;
+    }
+  spin_unlock_irqrestore(&priv->lock, flags);
 
   return OK;
 }
