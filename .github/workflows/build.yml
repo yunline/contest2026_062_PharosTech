@@ -98,6 +98,32 @@ jobs:
           git fetch ci ${{ env.MANIFEST_COMMIT }}
           git checkout FETCH_HEAD
 
+      # 获取固件
+      - name: Get firmware
+        uses: robinraju/release-downloader@v1.13
+        with:
+          repository: ${{ secrets.FW_REPO }}
+          latest: true
+          fileName: 'firmware.zip'
+          extract: true
+          out-file-path: ${{ env.OPENVELA_DIR }}/${{ env.REPO_NAME }}/drivers/drivers/sv6621/firmware
+          extract-path: ${{ env.OPENVELA_DIR }}/${{ env.REPO_NAME }}/drivers/drivers/sv6621/firmware
+          token: ${{ secrets.FW_TOKEN }}
+
+      # 验证固件存在
+      - name: Verify firmware present
+        run: |
+          FW_DIR="${{ env.OPENVELA_DIR }}/${{ env.REPO_NAME }}/drivers/drivers/sv6621/firmware"
+          REQUIRED="SWT6621S_IRAM_SDIO.bin SWT6621S_DRAM_SDIO.bin SWT6621S_NV_SDIO_ALONE.bin SWT6621S_SEEKWAVE_R00001.bin"
+          for f in $REQUIRED; do
+            if [ ! -f "$FW_DIR/$f" ]; then
+              echo "::error::Missing SV6621 firmware: $FW_DIR/$f"
+              exit 1
+            fi
+          done
+          ls -la "$FW_DIR"
+          echo "All SV6621 firmware blobs present."
+
       # CMake 构建
       - name: Build (CMake)
         id: cmake_build
@@ -106,13 +132,13 @@ jobs:
           cd ${{ env.OPENVELA_DIR }}
           ./build.sh ${{ env.REPO_NAME }}/${{ matrix.config }} --cmake
 
-      - name: Upload CMake artifact
-        if: steps.cmake_build.outcome == 'success'
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ env.CONFIG_SLUG }}-cmake
-          path: ${{ env.OPENVELA_DIR }}/cmake_out/**/nuttx.bin
-          if-no-files-found: error
+      # - name: Upload CMake artifact
+      #   if: steps.cmake_build.outcome == 'success'
+      #   uses: actions/upload-artifact@v4
+      #   with:
+      #     name: ${{ env.CONFIG_SLUG }}-cmake
+      #     path: ${{ env.OPENVELA_DIR }}/cmake_out/**/nuttx.bin
+      #     if-no-files-found: error
 
       # Makefile 构建
       - name: Build (Makefile)
@@ -123,13 +149,13 @@ jobs:
           ./build.sh ${{ env.REPO_NAME }}/${{ matrix.config }} distclean
           ./build.sh ${{ env.REPO_NAME }}/${{ matrix.config }} -j4
 
-      - name: Upload Makefile artifact
-        if: steps.make_build.outcome == 'success'
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ env.CONFIG_SLUG }}-makefile
-          path: ${{ env.OPENVELA_DIR }}/nuttx/nuttx.bin
-          if-no-files-found: error
+      # - name: Upload Makefile artifact
+      #   if: steps.make_build.outcome == 'success'
+      #   uses: actions/upload-artifact@v4
+      #   with:
+      #     name: ${{ env.CONFIG_SLUG }}-makefile
+      #     path: ${{ env.OPENVELA_DIR }}/nuttx/nuttx.bin
+      #     if-no-files-found: error
 
       # 任一构建失败则 job 失败
       - name: Check build results
