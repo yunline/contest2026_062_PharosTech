@@ -26,6 +26,7 @@
 
 #include "kickpi_k7.h"
 #include <nuttx/config.h>
+#include <stdbool.h>
 
 #ifdef CONFIG_KICKPI_K7_LCD
 
@@ -46,14 +47,50 @@
  * Pre-processor Definitions
  ****************************************************************************/
 
-#define GPIO_FSPI1_D0   (GPIO_PORT2 | GPIO_PIN_A0 | GPIO_ALT | GPIO_AF2)
-#define GPIO_FSPI1_D1   (GPIO_PORT2 | GPIO_PIN_A1 | GPIO_ALT | GPIO_AF2)
-#define GPIO_FSPI1_D2   (GPIO_PORT2 | GPIO_PIN_A2 | GPIO_ALT | GPIO_AF2)
-#define GPIO_FSPI1_D3   (GPIO_PORT2 | GPIO_PIN_A3 | GPIO_ALT | GPIO_AF2)
-#define GPIO_FSPI1_CSN0 (GPIO_PORT2 | GPIO_PIN_A4 | GPIO_ALT | GPIO_AF2)
-#define GPIO_FSPI1_CLK  (GPIO_PORT2 | GPIO_PIN_A5 | GPIO_ALT | GPIO_AF2)
+/* FSPI1 pins are muxed on GPIO2_A with IOMUX alternate function AF2.  The
+ * pinset macros carry only the pin identity (port + pin); the AF is applied
+ * via rk3576_gpio_set_af().  NOTE: these pins share GPIO2_A with SDMMC, so
+ * the SD card must be removed before any FSPI operation.
+ */
+
+#define GPIO_FSPI1_D0   (GPIO_PORT2 | GPIO_PIN_A0)
+#define GPIO_FSPI1_D1   (GPIO_PORT2 | GPIO_PIN_A1)
+#define GPIO_FSPI1_D2   (GPIO_PORT2 | GPIO_PIN_A2)
+#define GPIO_FSPI1_D3   (GPIO_PORT2 | GPIO_PIN_A3)
+#define GPIO_FSPI1_CSN0 (GPIO_PORT2 | GPIO_PIN_A4)
+#define GPIO_FSPI1_CLK  (GPIO_PORT2 | GPIO_PIN_A5)
 
 #define GPIO_LCD_SEL    (GPIO_PORT4 | GPIO_PIN_A6)
+#define GPIO_LCD_RST    (GPIO_PORT4 | GPIO_PIN_A4)
+
+/* IOMUX alternate function of the FSPI1 signal group */
+
+#define KICKPI_K7_LCD_FSPI1_AF 2
+
+/* Claim a pin (once) and mux it to the given IOMUX alternate function.
+ * The handle is retained for the lifetime of the FSPI/LCD peripheral, so
+ * it is never released here.
+ */
+
+#define _SET_GPIO_AF(pinset, af)                        \
+  do                                                    \
+    {                                                   \
+      static FAR struct gpio_dev_s *handle;             \
+      if (handle == NULL)                               \
+        {                                               \
+          ret = rk3576_gpio_get((pinset), &handle);     \
+          if (ret < 0)                                  \
+            {                                           \
+              syslog(LOG_ERR,                           \
+                     "ERROR: failed to get fspi gpio, " \
+                     "pinset: %u\n",                    \
+                     (pinset));                         \
+              return ret;                               \
+            }                                           \
+        }                                               \
+      rk3576_gpio_set_af(handle, (af));                 \
+    }                                                   \
+  while (0)
 
 /* qspi frequency */
 #define LCD_QSPI_FREQ 80000000
@@ -66,11 +103,17 @@
 
 static FAR struct lcd_dev_s *g_lcd[2];
 
+/* GPIO handles for the LCD panel/reset GPIOs (claimed in
+ * kickpi_k7_lcd_initialize and kept for the driver lifetime). */
+
+static FAR struct gpio_dev_s *g_lcd_sel_gpio;
+static FAR struct gpio_dev_s *g_lcd_rst_gpio;
+
 static void lcd0_select_cb(bool sel)
 {
   if (sel)
     {
-      rk3576_gpio_write(GPIO_LCD_SEL, false);
+      rk3576_gpio_write_bit(g_lcd_sel_gpio, false);
     }
 }
 
@@ -78,7 +121,7 @@ static void lcd1_select_cb(bool sel)
 {
   if (sel)
     {
-      rk3576_gpio_write(GPIO_LCD_SEL, true);
+      rk3576_gpio_write_bit(g_lcd_sel_gpio, true);
     }
 }
 
@@ -112,17 +155,41 @@ int kickpi_k7_lcd_initialize(void)
   FAR struct lcd_dev_s *lcd1;
   int ret;
 
-  {
-    rk3576_config_gpio(GPIO_FSPI1_D0);
-    rk3576_config_gpio(GPIO_FSPI1_D1);
-    rk3576_config_gpio(GPIO_FSPI1_D2);
-    rk3576_config_gpio(GPIO_FSPI1_D3);
-    rk3576_config_gpio(GPIO_FSPI1_CSN0);
-    rk3576_config_gpio(GPIO_FSPI1_CLK);
+  /* Mux the FSPI1 data/control pins to their IOMUX alternate function
+   * (AF2).  Note that FSPI1 pins share GPIO2_A with SDMMC.
+   */
 
-    // sel
-    rk3576_config_gpio(GPIO_LCD_SEL | GPIO_OUTPUT);
-  }
+  _SET_GPIO_AF(GPIO_FSPI1_D0, KICKPI_K7_LCD_FSPI1_AF);
+  _SET_GPIO_AF(GPIO_FSPI1_D1, KICKPI_K7_LCD_FSPI1_AF);
+  _SET_GPIO_AF(GPIO_FSPI1_D2, KICKPI_K7_LCD_FSPI1_AF);
+  _SET_GPIO_AF(GPIO_FSPI1_D3, KICKPI_K7_LCD_FSPI1_AF);
+  _SET_GPIO_AF(GPIO_FSPI1_CSN0, KICKPI_K7_LCD_FSPI1_AF);
+  _SET_GPIO_AF(GPIO_FSPI1_CLK, KICKPI_K7_LCD_FSPI1_AF);
+
+  /* sel - panel select output.  The handle is kept for the select
+   * callbacks (lcd0/lcd1_select_cb).
+   */
+
+  ret = rk3576_gpio_get(GPIO_LCD_SEL, &g_lcd_sel_gpio);
+  if (ret < 0)
+    {
+      syslog(LOG_ERR, "ERROR: failed to get LCD_SEL gpio: %d\n", ret);
+      return ret;
+    }
+
+  rk3576_gpio_set_mode(g_lcd_sel_gpio, RK3576_GPIO_OUTPUT);
+
+  /* rst - LCD reset output, driven high (out of reset) */
+
+  ret = rk3576_gpio_get(GPIO_LCD_RST, &g_lcd_rst_gpio);
+  if (ret < 0)
+    {
+      syslog(LOG_ERR, "ERROR: failed to get LCD_RST gpio: %d\n", ret);
+      return ret;
+    }
+
+  rk3576_gpio_set_mode(g_lcd_rst_gpio, RK3576_GPIO_OUTPUT);
+  rk3576_gpio_write_bit(g_lcd_rst_gpio, true);
 
   qspi = rk3576_fspi_initialize(1, 0);
 
