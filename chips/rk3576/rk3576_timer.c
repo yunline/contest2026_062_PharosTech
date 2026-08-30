@@ -93,14 +93,17 @@
   (((uint64_t)(us) * ((freq) / 1000000ULL)) + \
    (((uint64_t)(us) * ((freq) % 1000000ULL)) / 1000000ULL))
 
-/* ticks -> us.  Defensive form: guard against freq < 1 MHz (freq/1e6 == 0
- * would divide by zero) by using a single 64-bit multiply-then-divide.
- * With t bounded by UINT32_MAX us * freq the product stays well inside
- * uint64_t for every real RK3576 timer rate.
+/* ticks -> us.  Split form: (t/freq)*1e6 + ((t%freq)*1e6)/freq.  This keeps
+ * every intermediate value inside uint64_t even for a long timeout, where t
+ * can reach UINT32_MAX us * freq (e.g. ~4.29e17 ticks at 100 MHz) and a
+ * single (t * 1e6) multiply would overflow uint64_t (~1.84e19).  Also guard
+ * against freq == 0 to avoid divide-by-zero.
  */
 
-#define TIMER_TICKS_TO_USEC(freq, t) \
-  ((uint32_t)(((uint64_t)(t)*1000000ULL) / ((freq) ? (freq) : 1ULL)))
+#define TIMER_TICKS_TO_USEC(freq, t)                                       \
+  ((uint32_t)((((uint64_t)(t) / ((freq) ? (freq) : 1ULL)) * 1000000ULL) +  \
+              ((((uint64_t)(t) % ((freq) ? (freq) : 1ULL)) * 1000000ULL) / \
+               ((freq) ? (freq) : 1ULL))))
 
 /****************************************************************************
  * Private Types
@@ -291,10 +294,17 @@ static int rk3576_timer_interrupt(int irq, FAR void *context, FAR void *arg)
       flags = spin_lock_irqsave(&priv->lock);
       if (priv->gen == gen)
         {
-          if (next_interval > 0)
-            {
-              rk3576_timer_settimeout_locked(priv, next_interval);
-            }
+          /* In user-defined count-down mode the counter does NOT auto-reload
+           * on expiry: after counting to 0 it stays there until the load
+           * registers are rewritten.  Reloading every time (disable -> load
+           * -> enable) is therefore required even when the callback did not
+           * request a new interval (next_interval == 0), in which case we
+           * reuse priv->timeout.  A bare re-enable with CURR_VALUE == 0
+           * would never produce another expiry.
+           */
+
+          rk3576_timer_settimeout_locked(
+              priv, next_interval > 0 ? next_interval : priv->timeout);
 
           rk3576_timer_start_locked(priv);
         }
