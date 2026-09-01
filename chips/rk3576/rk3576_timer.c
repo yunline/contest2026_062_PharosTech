@@ -298,11 +298,18 @@ static int rk3576_timer_interrupt(int irq, FAR void *context, FAR void *arg)
   if (callback == NULL)
     {
       /* No upper-half handler registered: nothing to notify, the channel
-       * simply expired and is now stopped.  Fall through to the common
-       * unlock/return.
+       * simply expired.  In user-defined count-down mode the hardware is
+       * still enabled with the counter parked at 0; merely clearing
+       * priv->started would leave CONTROL.EN set, so a later TCIOC_START
+       * would rewrite an identical CONTROL word and never produce the
+       * disable -> enable reload edge the mode requires (TRM 14.3.2).
+       * Disable the hardware so the next start performs a real 0 -> 1
+       * edge.  This runs under priv->lock, so no gen check is needed here
+       * (unlike the one-shot branch below, which drops the lock to run the
+       * callback).
        */
 
-      priv->started = false;
+      rk3576_timer_stop_locked(priv);
       spin_unlock_irqrestore(&priv->lock, flags);
       return OK;
     }
@@ -338,16 +345,23 @@ static int rk3576_timer_interrupt(int irq, FAR void *context, FAR void *arg)
       return OK;
     }
 
-  /* One-shot: the channel has expired.  Only mark it stopped if the
-   * state did not change during the callback; a concurrent TCIOC_START
-   * has already re-enabled the hardware, so leave priv->started as the
-   * ioctl set it.
+  /* One-shot: the channel has expired.  In user-defined count-down mode the
+   * counter does NOT auto-reload and the hardware is still enabled with the
+   * counter parked at 0.  If we only cleared priv->started here, a later
+   * TCIOC_START would rewrite an identical CONTROL word (EN already 1) and
+   * never produce the disable -> enable edge that user-defined mode needs
+   * in order to reload the counter (TRM 14.3.2: "User need to disable timer
+   * firstly and follow the programming sequence").  Disable the hardware so
+   * the next start performs a real 0 -> 1 edge.  Only do so if the state
+   * did not change during the callback; a concurrent TCIOC_START has
+   * already re-enabled the hardware, so leave it exactly as the ioctl set
+   * it.
    */
 
   flags = spin_lock_irqsave(&priv->lock);
   if (priv->gen == gen)
     {
-      priv->started = false;
+      rk3576_timer_stop_locked(priv);
     }
   spin_unlock_irqrestore(&priv->lock, flags);
 
