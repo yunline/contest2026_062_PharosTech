@@ -98,17 +98,25 @@ SECTIONS
   } :text
   _edata = .; /* End+1 of .data */
 
-  .bss : {                     /* BSS */
+  /* BSS and init stack are NOLOAD: they are zeroed at runtime by
+   * arm64_data_initialize() in arm64_head.S and must NOT be stored in
+   * the image.  Keeping them inside a PT_LOAD segment instead expands a
+   * huge all-zero region into nuttx.bin, which (a) wastes flash and
+   * (b) enlarges the packed BL33 image past SPL's small SRAM buffer and
+   * corrupts the boot chain (see tools/k7_sdpack/build_sd.sh notes).
+   */
+
+  .bss (NOLOAD) : {           /* BSS */
        . = ALIGN(8);
        _sbss = .;
-       *(.bss)
+       *(.bss .bss.*)
        . = ALIGN(8);
+       _ebss = .;
   } :text
-  . = ALIGN(4096);
-  _ebss = .;
   _szbss = _ebss - _sbss;
 
-  .initstack : {             /* INIT STACK */
+  .initstack (NOLOAD) : {   /* INIT STACK */
+       . = ALIGN(8);
        _s_initstack = .;
        *(.initstack)
        . = ALIGN(16);
@@ -116,6 +124,22 @@ SECTIONS
   . = ALIGN(4096);
   _e_initstack = . ;
   g_idle_topstack = . ;
+
+  /* NOTE: _szdata must span data + bss + initstack (i.e. up to
+   * _e_initstack), NOT just _edata.  arm64_mmu.c() builds the MMU
+   * read-write mapping for the whole NuttX data region from _szdata
+   * (see g_mmu_nxrt_regions "nx_data").  If _szdata were truncated to
+   * _edata - _sdata (16 bytes), bss/initstack would end up unmapped and
+   * the first access after MMU is enabled faults.  NOLOAD only removes the
+   * zero-fill from the on-media image; it does not change the runtime
+   * VMA layout, so the runtime extent must still reach _e_initstack.
+   *
+   * _e_initstack must also be page (4096) aligned: init_xlat_tables()
+   * asserts that every map region's size is aligned to PAGE_SIZE (see
+   * arm64_mmu.c __MMU_ASSERT at "address/size are not page aligned").
+   * Keeping ALIGN(4096) before _e_initstack satisfies both the MMU
+   * assert and keeps _szdata page-aligned.
+   */
 
   _szdata = _e_initstack - _sdata;
 
