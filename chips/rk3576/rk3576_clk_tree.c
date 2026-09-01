@@ -2455,9 +2455,11 @@ static void rk3576_clk_register_dmac(void)
  *   TIMER_NS_0:
  *     clk_timer0_root: mux @ CLKSEL_CON(71)[14] (1-bit), gate GATE_CON(17)[5]
  *     clk_timer0..5:   gates @ GATE_CON(17)[6..11], parent clk_timer0_root
+ *     pclk_bustimer0:  gate @ GATE_CON(17)[3], parent pclk_bus_root (APB)
  *
  *   TIMER_NS_1:
  *     clk_timer1_root: mux @ CLKSEL_CON(72)[6] (1-bit), gate GATE_CON(18)[10]
+ *     pclk_bustimer1:  gate @ GATE_CON(17)[4], parent pclk_bus_root (APB)
  *     clk_timer6/9/10: gates @ GATE_CON(18)[11]/[14]/[15]
  *     clk_timer7:      mux @ CLKSEL_CON(72)[13:12] (2-bit, +lclk_asrc_src_0)
  *                      div @ CLKSEL_CON(72)[11:7] (5-bit, div_con+1)
@@ -2515,6 +2517,20 @@ static void rk3576_clk_register_timer(void)
   };
 
   const unsigned long cru = RK3576_CRU_ADDR;
+
+  /* TIMER_NS_0/1 each have two clock domains (TRM 14.5.1): the functional
+   * clk_timern (modelled above via the root mux/gate) and the APB bus
+   * clock pclk_bustimer0/1, which gates the register interface.  Both
+   * pclk gates live in CRU_GATE_CON17 (0x0844), bits 4:3, SET_TO_DISABLE.
+   */
+
+  clk_register_gate("pclk_bustimer0", "pclk_bus_root", CLK_NAME_IS_STATIC,
+                    cru + RK3576_CRU_GATE_CON(17), 3,
+                    CLK_GATE_HIWORD_MASK | CLK_GATE_SET_TO_DISABLE);
+
+  clk_register_gate("pclk_bustimer1", "pclk_bus_root", CLK_NAME_IS_STATIC,
+                    cru + RK3576_CRU_GATE_CON(17), 4,
+                    CLK_GATE_HIWORD_MASK | CLK_GATE_SET_TO_DISABLE);
 
   /* TIMER_NS_0: root + CH0..CH5. */
 

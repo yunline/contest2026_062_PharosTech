@@ -47,6 +47,12 @@
  * hard-coded constant, which also stays correct if a bootloader earlier
  * reprogrammed the mux away from the 24 MHz default.
  *
+ * Besides the per-channel counting clock there is also the block-level APB
+ * register-interface clock (pclk_bustimer0/1, TRM 14.5.1).  It gates the
+ * registers of every channel in a block, so it is enabled once per block
+ * (on the first channel's initialization) rather than per channel.  It is
+ * never rate-managed by this driver.
+ *
  * The hardware counter and its two 32-bit load registers are 64-bit, so the
  * whole derived load count is programmed (low half into LOAD_COUNT0, high
  * half into LOAD_COUNT1) and both current-value registers are read back.
@@ -208,6 +214,26 @@ static const int g_timer_irq[2][RK3576_TIMER_CHANS] = {
  */
 
 static struct rk3576_timer_s g_rk3576_timer[2][RK3576_TIMER_CHANS];
+
+/* Block-level APB bus clock (pclk) state.
+ *
+ * Unlike the per-channel counting clock clk_timerN, the APB register-interface
+ * clock is shared at the block level: TIMER_NS_0's channels are all behind
+ * pclk_bustimer0, and TIMER_NS_1's behind pclk_bustimer1 (TRM 14.5.1).  It
+ * must therefore be enabled exactly once per block, not once per channel.
+ * clk_enable()/clk_disable() do ref-count internally, but we still track the
+ * number of enabled channels per block so the first channel to come up
+ * enables pclk and (in a future uninitialize path) the last channel to go
+ * away can disable it.  The pclk handle itself is block-scoped and shared.
+ */
+
+struct rk3576_timer_block_s
+{
+  FAR struct clk_s *pclk; /* Block APB clock (pclk_bustimer0/1)       */
+  unsigned int enabled;   /* Number of channels currently enabled     */
+};
+
+static struct rk3576_timer_block_s g_rk3576_timer_block[2];
 
 /****************************************************************************
  * Private Functions
@@ -589,6 +615,10 @@ static int rk3576_timer_maxtimeout(FAR struct timer_lowerhalf_s *lower,
  *   channel  - Channel index within the block (0-based,
  *              < RK3576_TIMER_CHANS).
  *
+ *   On initialization the block's APB bus clock pclk_bustimer0/1 is
+ *   enabled once (shared across the block), and the per-channel counting
+ *   clock clk_timerN is enabled and its rate cached.
+ *
  * Returned Value:
  *   A timer_lowerhalf_s handle on success; NULL on an invalid timer/channel
  *   or if the interrupt could not be attached.
@@ -597,6 +627,7 @@ static int rk3576_timer_maxtimeout(FAR struct timer_lowerhalf_s *lower,
 FAR struct timer_lowerhalf_s *rk3576_timer_initialize(int timer, int channel)
 {
   FAR struct rk3576_timer_s *priv;
+  FAR struct rk3576_timer_block_s *blk;
   char clk_name[16];
   FAR struct clk_s *clk;
   uint32_t freq;
@@ -616,6 +647,40 @@ FAR struct timer_lowerhalf_s *rk3576_timer_initialize(int timer, int channel)
     }
 
   priv = &g_rk3576_timer[timer][channel];
+  blk = &g_rk3576_timer_block[timer];
+
+  /* Enable the block-level APB bus clock (pclk_bustimer0/1) before touching
+   * any channel register.  The pclk is shared across the whole block, so it
+   * is enabled once on the first channel and reused by later channels.
+   * clk_enable() ref-counts internally so repeated enables are harmless, but
+   * we only resolve/enable it on the transition from 0 -> 1 enabled channels
+   * for clarity.  Any subsequent channel on the same block skips this step.
+   */
+
+  if (blk->enabled == 0)
+    {
+      char pclk_name[16];
+
+      snprintf(pclk_name, sizeof(pclk_name), "pclk_bustimer%d", timer);
+      blk->pclk = clk_get(pclk_name);
+      if (blk->pclk == NULL)
+        {
+          tmrerr("ERROR: failed to get block clock %s\n", pclk_name);
+          return NULL;
+        }
+
+      ret = clk_enable(blk->pclk);
+      if (ret < 0)
+        {
+          tmrerr("ERROR: failed to enable block clock %s\n", pclk_name);
+          blk->pclk = NULL;
+          return NULL;
+        }
+    }
+
+  /* The block pclk is now on for this channel. */
+
+  blk->enabled++;
 
   /* Initialize the channel state before the IRQ line can ever be enabled:
    * base/lock/ops first, then stop and clear the hardware, then resolve
@@ -659,22 +724,22 @@ FAR struct timer_lowerhalf_s *rk3576_timer_initialize(int timer, int channel)
   if (clk == NULL)
     {
       tmrerr("ERROR: failed to get clock %s\n", clk_name);
-      return NULL;
+      goto err_pclk;
     }
 
   ret = clk_enable(clk);
   if (ret < 0)
     {
       tmrerr("ERROR: failed to enable clock %s\n", clk_name);
-      return NULL;
+      goto err_pclk;
     }
 
   freq = clk_get_rate(clk);
   if (freq == 0)
     {
       tmrerr("ERROR: clock %s has invalid rate 0\n", clk_name);
-      clk_disable(clk);
-      return NULL;
+
+      goto err_clk;
     }
 
   priv->clk = clk;
@@ -690,12 +755,34 @@ FAR struct timer_lowerhalf_s *rk3576_timer_initialize(int timer, int channel)
     {
       tmrerr("ERROR: failed to attach IRQ %d\n", g_timer_irq[timer][channel]);
       clk_disable(clk);
-      return NULL;
+      priv->clk = NULL;
+      priv->freq = 0;
+      goto err_pclk;
     }
 
   up_enable_irq(g_timer_irq[timer][channel]);
 
   return (FAR struct timer_lowerhalf_s *)priv;
+
+err_clk:
+  clk_disable(clk);
+
+err_pclk:
+  /* Roll back the block pclk reference taken above.  When the last channel
+   * on a block fails to come up, disable the shared pclk so it does not
+   * leak an enabled clock without any live channel.
+   */
+
+  if (--blk->enabled == 0)
+    {
+      if (blk->pclk != NULL)
+        {
+          clk_disable(blk->pclk);
+          blk->pclk = NULL;
+        }
+    }
+
+  return NULL;
 }
 
 #endif /* CONFIG_RK3576_TIMER */
