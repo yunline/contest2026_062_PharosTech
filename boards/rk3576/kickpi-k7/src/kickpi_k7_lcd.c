@@ -189,7 +189,16 @@ int kickpi_k7_lcd_initialize(void)
     }
 
   rk3576_gpio_set_mode(g_lcd_rst_gpio, RK3576_GPIO_OUTPUT);
+
+  /* Assert reset and hold for 100 us */
+  rk3576_gpio_write_bit(g_lcd_rst_gpio, false);
+  nxsig_usleep(100);
+
+  /* Deassert reset */
   rk3576_gpio_write_bit(g_lcd_rst_gpio, true);
+
+  /* Wait for the initiallization of CPLD and LCD controller  */
+  nxsig_usleep(20000);
 
   qspi = rk3576_fspi_initialize(1, 0);
 
