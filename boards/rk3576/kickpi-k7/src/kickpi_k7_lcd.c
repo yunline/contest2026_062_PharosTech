@@ -32,7 +32,9 @@
 
 #include "rk3576_gpio.h"
 #include <errno.h>
+#include <nuttx/ioexpander/gpio.h>
 #include <nuttx/spi/qspi.h>
+#include <string.h>
 #include <syslog.h>
 
 #include "rk3576_fspi.h"
@@ -42,6 +44,8 @@
 #include <nuttx/signal.h>
 
 #include <nuttx/lcd/lcd_dev.h>
+
+#include "rk3576_pwm.h"
 
 /****************************************************************************
  * Pre-processor Definitions
@@ -63,9 +67,46 @@
 #define GPIO_LCD_SEL    (GPIO_PORT4 | GPIO_PIN_A6)
 #define GPIO_LCD_RST    (GPIO_PORT4 | GPIO_PIN_A4)
 
+/* TE (vertical-sync) pins.  The panels output an HSYNC TE which the on-board
+ * CPLD converts to a per-screen VSYNC TE before routing it to these GPIOs:
+ *   - LCD0 TE -> GPIO3_C6  -> /dev/gpio1
+ *   - LCD1 TE -> GPIO3_C5  -> /dev/gpio2
+ * The VSYNC TE is a level signal: HIGH = blanking, LOW = scanning.  Both
+ * edges carry a meaningful event (rising = blank-start, falling =
+ * scan-start), so the pins are registered as both-edge interrupt inputs.
+ * minor 0 is already taken by the on-board LED (/dev/gpio0). */
+
+#define GPIO_LCD_TE0            (GPIO_PORT3 | GPIO_PIN_C6)
+#define GPIO_LCD_TE1            (GPIO_PORT3 | GPIO_PIN_C5)
+
+#define KICKPI_K7_LCD_TE0_MINOR 1
+#define KICKPI_K7_LCD_TE1_MINOR 2
+
 /* IOMUX alternate function of the FSPI1 signal group */
 
 #define KICKPI_K7_LCD_FSPI1_AF 2
+
+/* Backlight control.  The display backlight is driven by GPIO2_D7, which
+ * is muxed to PWM2 CH7 (PWM2_CH7_M2, IOMUX alternate function 0xd = 13).
+ * The backlight is active-low: HIGH = off, LOW = on.  The RK3576 PWM
+ * channel outputs active-high by default, so the user layer controls
+ * brightness by inverting the duty (duty = full → off, duty = 0 → fully
+ * on).  The channel is registered as /dev/pwm0.
+ */
+
+#define GPIO_LCD_BACKLIGHT               (GPIO_PORT2 | GPIO_PIN_D7)
+#define KICKPI_K7_LCD_BACKLIGHT_AF       13
+
+#define KICKPI_K7_LCD_BACKLIGHT_PWM_CTRL 2
+#define KICKPI_K7_LCD_BACKLIGHT_PWM_CH   7
+
+#define KICKPI_K7_LCD_BACKLIGHT_DEVPATH  "/dev/pwm0"
+
+/* Initial PWM output frequency (Hz).  Only meaningful until the user layer
+ * reconfigures the channel; 10 kHz is a comfortable LED/backlight rate.
+ */
+
+#define KICKPI_K7_LCD_BACKLIGHT_INIT_FREQ 10000
 
 /* Claim a pin (once) and mux it to the given IOMUX alternate function.
  * The handle is retained for the lifetime of the FSPI/LCD peripheral, so
@@ -109,6 +150,16 @@ static FAR struct lcd_dev_s *g_lcd[2];
 static FAR struct gpio_dev_s *g_lcd_sel_gpio;
 static FAR struct gpio_dev_s *g_lcd_rst_gpio;
 
+/* TE (vertical-sync) interrupt-capable GPIO handles.  Claimed and kept for
+ * the LCD driver lifetime; registered as /dev/gpio1 and /dev/gpio2. */
+
+static FAR struct gpio_dev_s *g_lcd_te_gpio[2];
+
+/* GPIO handle for the backlight PWM pin (GPIO2_D7, claimed and kept for the
+ * driver lifetime). */
+
+static FAR struct gpio_dev_s *g_lcd_backlight_gpio;
+
 static void lcd0_select_cb(bool sel)
 {
   if (sel)
@@ -123,6 +174,132 @@ static void lcd1_select_cb(bool sel)
     {
       rk3576_gpio_write_bit(g_lcd_sel_gpio, true);
     }
+}
+
+/* Claim one TE pin and register it as a both-edge interrupt character
+ * device (/dev/gpioN).  The panels output an HSYNC TE; the on-board CPLD
+ * converts it to a per-screen VSYNC TE before arriving here (HIGH blanking,
+ * LOW scanning), so both edges carry a meaningful event.  The handle is
+ * retained in g_lcd_te_gpio[] for the LCD driver lifetime. */
+
+static int kickpi_k7_lcd_te_register(int sid)
+{
+  gpio_pinset_t pinset = (sid == 0) ? GPIO_LCD_TE0 : GPIO_LCD_TE1;
+  int minor = (sid == 0) ? KICKPI_K7_LCD_TE0_MINOR : KICKPI_K7_LCD_TE1_MINOR;
+  FAR struct gpio_dev_s *handle;
+  int ret;
+
+  ret = rk3576_gpio_get(pinset, &handle);
+  if (ret < 0)
+    {
+      syslog(LOG_ERR, "ERROR: failed to get LCD TE%d gpio: %d\n", sid, ret);
+      return ret;
+    }
+
+  /* Configure as an input, both-edge external interrupt. */
+
+  rk3576_gpio_set_mode(handle, RK3576_GPIO_INPUT);
+  rk3576_gpio_set_pull(handle, RK3576_GPIO_FLOAT);
+  rk3576_gpio_set_int_type(handle, RK3576_GPIO_INT_EDGE);
+  rk3576_gpio_set_int_pol(handle, RK3576_GPIO_INT_BOTH_EDGE);
+
+  /* The /dev/gpioN upper half keys its interrupt support off gp_pintype:
+   * both-edge interrupt. */
+
+  handle->gp_pintype = GPIO_INTERRUPT_BOTH_PIN;
+
+  ret = gpio_pin_register(handle, minor);
+  if (ret < 0)
+    {
+      syslog(LOG_ERR, "ERROR: gpio_pin_register(/dev/gpio%d) failed: %d\n",
+             minor, ret);
+      rk3576_gpio_put(handle);
+      return ret;
+    }
+
+  g_lcd_te_gpio[sid] = handle;
+
+  syslog(LOG_INFO, "LCD TE%d: /dev/gpio%d registered (%p)\n", sid, minor,
+         handle);
+
+  return OK;
+}
+
+/****************************************************************************
+ * Name: kickpi_k7_lcd_backlight_register
+ *
+ * Description:
+ *   Mux the backlight pin (GPIO2_D7 -> PWM2 CH7, alternate function 13)
+ *   and register the RK3576 PWM channel as the /dev/pwm0 character device
+ *   for the user layer to drive the display backlight.
+ *
+ *   The backlight is active-low (HIGH = off, LOW = on) while the RK3576
+ *   PWM channel outputs active-high, so the caller controls brightness by
+ *   inverting the duty cycle: duty = 65536 (full) turns the backlight off,
+ *   duty = 0 turns it fully on.
+ *
+ * Returned Value:
+ *   Zero (OK) on success; a negated errno value is returned on any
+ *   failure.
+ *
+ ****************************************************************************/
+
+static int kickpi_k7_lcd_backlight_register(void)
+{
+  FAR struct pwm_lowerhalf_s *pwm;
+  struct pwm_info_s info;
+  int ret;
+
+  /* Claim the backlight pin and mux it to PWM2_CH7_M2 (AF 13). */
+
+  ret = rk3576_gpio_get(GPIO_LCD_BACKLIGHT, &g_lcd_backlight_gpio);
+  if (ret < 0)
+    {
+      syslog(LOG_ERR, "ERROR: failed to get backlight gpio: %d\n", ret);
+      return ret;
+    }
+
+  rk3576_gpio_set_af(g_lcd_backlight_gpio, KICKPI_K7_LCD_BACKLIGHT_AF);
+
+  /* Get the PWM2 CH7 lower-half and register it as /dev/pwm0. */
+
+  pwm = rk3576_pwm_initialize(KICKPI_K7_LCD_BACKLIGHT_PWM_CTRL,
+                              KICKPI_K7_LCD_BACKLIGHT_PWM_CH);
+  if (pwm == NULL)
+    {
+      syslog(LOG_ERR, "ERROR: rk3576_pwm_initialize(PWM2 CH%d) failed\n",
+             KICKPI_K7_LCD_BACKLIGHT_PWM_CH);
+      return -ENODEV;
+    }
+
+  /* Set the initial output to full duty (active-high, so HIGH = backlight
+   * off).  This keeps the backlight dark until the user layer explicitly
+   * drives it.
+   */
+
+  memset(&info, 0, sizeof(info));
+  info.frequency = KICKPI_K7_LCD_BACKLIGHT_INIT_FREQ;
+  info.duty = 0; /* 0 % duty, backlight fully on */
+
+  ret = pwm->ops->start(pwm, &info);
+  if (ret < 0)
+    {
+      syslog(LOG_ERR, "ERROR: backlight initial PWM start failed: %d\n", ret);
+      return ret;
+    }
+
+  ret = pwm_register(KICKPI_K7_LCD_BACKLIGHT_DEVPATH, pwm);
+  if (ret < 0)
+    {
+      syslog(LOG_ERR, "ERROR: pwm_register(%s) failed: %d\n",
+             KICKPI_K7_LCD_BACKLIGHT_DEVPATH, ret);
+      return ret;
+    }
+
+  syslog(LOG_INFO, "LCD backlight: %s registered (PWM2 CH%d)\n",
+         KICKPI_K7_LCD_BACKLIGHT_DEVPATH, KICKPI_K7_LCD_BACKLIGHT_PWM_CH);
+
+  return OK;
 }
 
 /****************************************************************************
@@ -154,6 +331,16 @@ int kickpi_k7_lcd_initialize(void)
   FAR struct lcd_dev_s *lcd0;
   FAR struct lcd_dev_s *lcd1;
   int ret;
+
+  /* Register the backlight PWM (GPIO2_D7 -> PWM2 CH7) as /dev/pwm0 for the
+   * user layer to drive the display backlight. */
+
+  ret = kickpi_k7_lcd_backlight_register();
+  if (ret < 0)
+    {
+      syslog(LOG_ERR, "ST77916: backlight register failed: %d\n", ret);
+      return ret;
+    }
 
   /* Mux the FSPI1 data/control pins to their IOMUX alternate function
    * (AF2).  Note that FSPI1 pins share GPIO2_A with SDMMC.
@@ -253,6 +440,26 @@ int kickpi_k7_lcd_initialize(void)
     }
 
   syslog(LOG_INFO, "ST77916: /dev/lcd1 registered (%p)\n", lcd1);
+
+  /* Register the TE (vertical-sync) pins as both-edge interrupt character
+   * devices (/dev/gpio1 and /dev/gpio2).  Consumed by the nyabula_display
+   * app as its vertical-sync source. */
+
+#ifdef CONFIG_DEV_GPIO
+  ret = kickpi_k7_lcd_te_register(0);
+  if (ret < 0)
+    {
+      syslog(LOG_ERR, "ST77916: TE0 gpio register failed: %d\n", ret);
+      return ret;
+    }
+
+  ret = kickpi_k7_lcd_te_register(1);
+  if (ret < 0)
+    {
+      syslog(LOG_ERR, "ST77916: TE1 gpio register failed: %d\n", ret);
+      return ret;
+    }
+#endif
 
   return OK;
 }

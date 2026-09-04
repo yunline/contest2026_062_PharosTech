@@ -83,13 +83,13 @@ if NYABULA_DISPLAY_TE_GPIO
 
 config NYABULA_DISPLAY_TE0_DEVPATH
 	string "TE GPIO device path for screen 0"
-	default "/dev/gpio0"
+	default "/dev/gpio1"
 	---help---
 		Path to the registered TE GPIO character device for screen 0.
 
 config NYABULA_DISPLAY_TE1_DEVPATH
 	string "TE GPIO device path for screen 1"
-	default "/dev/gpio1"
+	default "/dev/gpio2"
 	---help---
 		Path to the registered TE GPIO character device for screen 1.
 

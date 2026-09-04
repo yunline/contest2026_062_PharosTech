@@ -8,10 +8,15 @@
  * scan-start edges are caught).  This source uses the standard NuttX
  * CONFIG_DEV_GPIO character-device signal mechanism:
  *
- *   1. The board registers the TE pins once at power-up, e.g.
- *        rk3576_gpio_register(GPIO_TE0);  (-> /dev/gpioN, GPIO_INTERRUPT_...)
- *        rk3576_gpio_register(GPIO_TE1);
- *      (GPIO_TE0/GPIO_TE1 must be GPIO_INTERRUPT_BOTH_PIN pinsets.)
+ *   1. The board claims and registers the TE pins once at power-up, e.g.
+ *        rk3576_gpio_get(GPIO_TE0, &handle);
+ *        rk3576_gpio_set_mode(handle, RK3576_GPIO_INPUT);
+ *        rk3576_gpio_set_int_type(handle, RK3576_GPIO_INT_EDGE);
+ *        rk3576_gpio_set_int_pol(handle, RK3576_GPIO_INT_BOTH_EDGE);
+ *        handle->gp_pintype = GPIO_INTERRUPT_BOTH_PIN;
+ *        gpio_pin_register(handle, minor);   (-> /dev/gpioN)
+ *      (The rk3576 GPIO driver is handle-based; the deprecated pinset-based
+ *       rk3576_gpio_register(pinset) entry point no longer exists.)
  *
  *   2. This source open()s /dev/gpioN, registers a POSIX sigevent with
  *      GPIOC_REGISTER; the driver then sigqueue()s the process (from its
@@ -66,13 +71,13 @@
 #ifdef CONFIG_NYABULA_DISPLAY_TE0_DEVPATH
 #define NYABULA_TE_GPIO0_DEVPATH CONFIG_NYABULA_DISPLAY_TE0_DEVPATH
 #else
-#define NYABULA_TE_GPIO0_DEVPATH "/dev/gpio0"
+#define NYABULA_TE_GPIO0_DEVPATH "/dev/gpio1"
 #endif
 
 #ifdef CONFIG_NYABULA_DISPLAY_TE1_DEVPATH
 #define NYABULA_TE_GPIO1_DEVPATH CONFIG_NYABULA_DISPLAY_TE1_DEVPATH
 #else
-#define NYABULA_TE_GPIO1_DEVPATH "/dev/gpio1"
+#define NYABULA_TE_GPIO1_DEVPATH "/dev/gpio2"
 #endif
 
 /* Per-screen POSIX signal used by the GPIO driver to notify a TE edge. */
