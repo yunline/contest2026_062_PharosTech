@@ -30,6 +30,8 @@ ifeq ($(CONFIG_KICKPI_K7_WIFI),y)
 CSRCS += kickpi_k7_wifi.c
 CSRCS += kickpi_k7_sv6621_transport.c
 CFLAGS += -Wa,-I$(abspath $(TOPDIR)/drivers/platform/drivers/sv6621/firmware)
+endif
+
 # Makefile (legacy) build mode: expose the platform driver's public header
 # directory (boards/rk3576/drivers/include, shared by all platform drivers) so
 # this kernel-side board code can #include "<driver>.h".  Both this board code
@@ -39,7 +41,6 @@ CFLAGS += -Wa,-I$(abspath $(TOPDIR)/drivers/platform/drivers/sv6621/firmware)
 # mode exposes it via NUTTX_INCLUDE_DIRECTORIES instead of this file.)
 ifeq ($(CONFIG_NYABULA_CUSTOM_DRIVERS),y)
   CFLAGS += ${INCDIR_PREFIX}"$(BOARD_DIR)$(DELIM)..$(DELIM)drivers$(DELIM)include"
-endif
 endif
 
 ifeq ($(CONFIG_KICKPI_K7_AUDIO),y)
